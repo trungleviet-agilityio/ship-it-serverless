@@ -4,7 +4,7 @@ services:
       context: .
       args:
         GIT_SHA: ${GIT_SHA:-local}
-    image: sis-app:local
+    image: sls-app:local
     env_file: .env
     ports:
       - "8080:8080"

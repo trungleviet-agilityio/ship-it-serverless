@@ -108,7 +108,7 @@ jobs:
             releases.hashicorp.com:443
             registry.terraform.io:443
             sts.${{ vars.AWS_REGION }}.amazonaws.com:443
-            sis-${{ env.ENV }}-tfstate-${{ secrets.AWS_ACCOUNT_ID }}-${{ vars.AWS_REGION }}-an.s3.${{ vars.AWS_REGION }}.amazonaws.com:443
+            sls-${{ env.ENV }}-tfstate-${{ secrets.AWS_ACCOUNT_ID }}-${{ vars.AWS_REGION }}-an.s3.${{ vars.AWS_REGION }}.amazonaws.com:443
             ec2.${{ vars.AWS_REGION }}.amazonaws.com:443
             elasticloadbalancing.${{ vars.AWS_REGION }}.amazonaws.com:443
             ecs.${{ vars.AWS_REGION }}.amazonaws.com:443

@@ -22,7 +22,7 @@ variable "aws_region" {
 variable "prefix" {
   type        = string
   description = "Name prefix for every resource."
-  default     = "sis"
+  default     = "sls"
 
   validation {
     condition     = can(regex("^[a-z][a-z0-9]{1,9}$", var.prefix))

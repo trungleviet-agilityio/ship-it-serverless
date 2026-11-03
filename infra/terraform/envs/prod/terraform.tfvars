@@ -2,7 +2,7 @@
 # environments differ only through this file. No account ID here; aws_account_id comes from
 # TF_VAR_aws_account_id (CI) or a gitignored *.auto.tfvars.
 aws_region = "ap-southeast-1"
-prefix     = "sis"
+prefix     = "sls"
 env        = "prod"
 azs        = ["ap-southeast-1a", "ap-southeast-1b"]
 vpc_cidr   = "10.50.0.0/16"
