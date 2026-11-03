@@ -8,7 +8,7 @@
 #   3. Otherwise `crane push <archive> <registry>/<repository>:<tag>`, then the digest is read back from ECR. It must
 #      be a single image manifest, and equal the digest crane reported for the push.
 # crane logs in through a temporary DOCKER_CONFIG directory created under <temp dir> (default $RUNNER_TEMP) and
-# removed on exit, success or failure (the pattern of scripts/image/promote-copy.sh). The password travels through a
+# removed on exit, success or failure (the same pattern as the promotion copy). The password travels through a
 # pipe, never an argument. The registry host holds the account ID: logs carry the digest and the tag only, and error
 # text goes through the account ID redaction.
 # Needs the AWS CLI with deploy credentials, crane (scripts/ci/install-tools.sh <dir> crane), and ACCOUNT and REGION in

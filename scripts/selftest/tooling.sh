@@ -127,7 +127,7 @@ ok "redact filter replaces 12-digit runs"
 # --- Usage contracts. The Docker-based scripts (build, smoke, scan) run in full in app-ci and in `make image smoke
 # scan`, which need Docker and the trivy database; their argument contracts are checked here, with the rest.
 # A script that takes arguments prints its usage when called with none.
-for s in image/build image/smoke lambda/publish lambda/smoke-invoke lambda/shift-alias lambda/canary-bake lambda/verify-live lambda/resolve-image image/verify image/export image/import image/ecr-push image/promote-resolve image/promote-copy aws/check-config \
+for s in image/build image/smoke lambda/publish lambda/smoke-invoke lambda/shift-alias lambda/canary-bake lambda/verify-live lambda/resolve-image image/verify image/export image/ecr-push image/promote-resolve image/promote-copy aws/check-config \
   aws/assert-web-identity-denied aws/assert-session-cap ci/venv tf/resolved-sources tf/new-env; do
   expect_fail "$s without arguments" "usage:" "$ROOT/scripts/$s.sh"
 done

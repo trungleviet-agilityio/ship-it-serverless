@@ -155,7 +155,7 @@ version_json() {
 }
 # fn_config <APP_ENV> <IMAGE_DIGEST> <description>: the answer of get-function-configuration (environment and description).
 fn_config() { jq -cn --argjson v "$(fn_env "$1" "$2")" --arg d "$3" '{Variables: $v, Description: $d}'; }
-tf_desc="initial image (terraform)"
+tf_desc="initial image (terraform create) ${d}"
 publish_ready() {
   stub_reset
   stub aws-lambda-list-versions-by-function out "$(versions_json "3:sha=${other_sha} digest=${other_d}")"

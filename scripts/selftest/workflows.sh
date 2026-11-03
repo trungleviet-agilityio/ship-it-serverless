@@ -359,7 +359,7 @@ mutation_cases resolve_job_ok "$deploy_wf" resolve "the credential-free green ch
   '{"permissions":{"id-token":"write"}}' '{"environment":"dev"}' '{"if":"github.ref == '"'refs/heads/main'"'"}'
 # The deploy job waits for the gate: a rollback runs only after a green resolve, a deploy only after a green build.
 deploy_gate_ok() {
-  jq -e '(.needs | sort) == ["build-scan", "resolve"]
+  jq -e '([.needs] | flatten | sort) == ["build-scan", "resolve"]
     and (.if | test("inputs.mode == .rollback. && needs.build-scan.result == .skipped. && needs.resolve.result == .success."))' <<<"$1" >/dev/null
 }
 mutation_cases deploy_gate_ok "$deploy_wf" deploy "gated by resolve in mode rollback" '{"needs":"build-scan"}' \
