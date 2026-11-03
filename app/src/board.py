@@ -1,31 +1,65 @@
-"""Ship-it Board: tiny stdlib HTTP app for the ship-it-safely lab."""
+"""Ship-it Board: tiny stdlib HTTP app for the ship-it-serverless lab."""
 
 import hashlib
 import hmac
 import html
 import json
 import os
+import re
 import signal
 import threading
 import time
-import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+
+import aws_sigv4
 
 STARTED = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
 
 
+DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
+# A failed secret read is retried after this many seconds, so one cold-start error (throttling, a
+# network blip, an IAM change still propagating) does not leave the environment without a key.
+SECRET_RETRY_SECONDS = 60.0
+# Tests point the Secrets Manager call at a local fake server; None means the regional endpoint.
+_SECRETS_ENDPOINT: str | None = None
+_secret_lock = threading.Lock()
+# arn -> (value, monotonic time of the read); a failure is cached as "" with its time.
+_secret_cache: dict[str, tuple[str, float]] = {}
+
+
 def image_digest() -> str:
-    """Image digest from the ECS task metadata endpoint, or n/a on any error."""
-    uri = os.environ.get("ECS_CONTAINER_METADATA_URI_V4")
-    if not uri:
-        return "n/a"
-    try:
-        # The URI is set by the ECS agent, not by a request, so the scheme is trusted.
-        with urllib.request.urlopen(uri, timeout=1) as r:  # noqa: S310
-            return str(json.loads(r.read()).get("ImageID") or "n/a")
-    except Exception:
-        return "n/a"
+    """IMAGE_DIGEST set by the deploy before PublishVersion (ADR 0012 L6), or n/a."""
+    value = os.environ.get("IMAGE_DIGEST", "")
+    return value if DIGEST_RE.fullmatch(value) else "n/a"
+
+
+def api_key() -> str:
+    """APP_API_KEY if set (local, tests), else the secret read once with the execution role."""
+    local = os.environ.get("APP_API_KEY")
+    if local:
+        return local
+    arn = os.environ.get("APP_API_KEY_SECRET_ARN")
+    if not arn:
+        return ""
+    with _secret_lock:
+        cached = _secret_cache.get(arn)
+        if cached and (cached[0] or time.monotonic() - cached[1] < SECRET_RETRY_SECONDS):
+            return cached[0]
+        creds = aws_sigv4.Credentials(
+            os.environ.get("AWS_ACCESS_KEY_ID", ""),
+            os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
+            os.environ.get("AWS_SESSION_TOKEN", ""),
+        )
+        region = os.environ.get("AWS_REGION", "")
+        try:
+            value = aws_sigv4.get_secret_value(arn, region, creds, endpoint=_SECRETS_ENDPOINT)
+        except Exception as e:  # best effort: a failed read means secret_loaded: no and 401
+            # Class name only: the message could echo the ARN or response details.
+            print(f"secret read failed: {type(e).__name__}", flush=True)
+            value = ""
+        _secret_cache[arn] = (value, time.monotonic())
+        return value
 
 
 def color() -> str:
@@ -37,7 +71,7 @@ def color() -> str:
 
 
 def page() -> str:
-    key_set = "yes" if os.environ.get("APP_API_KEY") else "no"
+    key_set = "yes" if api_key() else "no"
     promoted = os.environ.get("APP_ENV") == "prod"
     shipped_by = "app-promote (dev digest)" if promoted else "app-deploy (digest-pinned)"
     rows = [
@@ -85,7 +119,7 @@ class Handler(BaseHTTPRequestHandler):
                 ),
             )
         elif path == "/admin":
-            expected = os.environ.get("APP_API_KEY", "").encode()
+            expected = api_key().encode()
             given = self.headers.get("X-API-Key", "").encode()
             if expected and hmac.compare_digest(given, expected):
                 self.send(200, json.dumps({"admin": "ok"}))
@@ -100,14 +134,14 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def make_server(port: int) -> ThreadingHTTPServer:
-    # 0.0.0.0 so the container port is reachable from Docker and the ALB.
+    # 0.0.0.0 so the port is reachable from Docker; on Lambda the Web Adapter calls it locally.
     return ThreadingHTTPServer(("0.0.0.0", port), Handler)  # noqa: S104
 
 
 def main() -> None:
     server = make_server(int(os.environ.get("PORT", "8080")))
     # shutdown() blocks until serve_forever() returns, so run it off the main thread.
-    # As PID 1 the default SIGTERM action is ignored, so without this ECS waits for SIGKILL.
+    # As PID 1 the default SIGTERM action is ignored, so without this `docker stop` waits for KILL.
     signal.signal(
         signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start()
     )

@@ -1,5 +1,7 @@
 """Tests for the Ship-it Board. Run from app/: python -m unittest discover -s tests"""
 
+import contextlib
+import io
 import json
 import os
 import signal
@@ -15,8 +17,11 @@ from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import board  # noqa: E402
+from test_aws_sigv4 import FakeSecretsManager  # noqa: E402
 
 KEY = "fake-test-key-123"
+DIGEST = "sha256:" + "ab" * 32
+ARN = "arn:aws:secretsmanager:ap-southeast-1:000000000000:secret:sis-dev-app-key-AbCdEf"
 REAL_URLOPEN = urllib.request.urlopen
 
 
@@ -104,52 +109,90 @@ class BoardTest(unittest.TestCase):
     def test_unknown_path(self) -> None:
         self.assertEqual(get(self.port, "/nope")[0], 404)
 
-    def test_digest_from_metadata(self) -> None:
-        class Resp:
-            def __enter__(self) -> "Resp":
-                return self
-
-            def __exit__(self, *a: object) -> None:
-                return None
-
-            def read(self) -> bytes:
-                return b'{"ImageID": "sha256:deadbeef"}'
-
-        with (
-            mock.patch.dict(os.environ, {"ECS_CONTAINER_METADATA_URI_V4": "http://x"}),
-            mock.patch("urllib.request.urlopen", return_value=Resp()),
-        ):
-            self.assertEqual(board.image_digest(), "sha256:deadbeef")
-
-    def test_digest_error_is_na(self) -> None:
-        with (
-            mock.patch.dict(os.environ, {"ECS_CONTAINER_METADATA_URI_V4": "http://x"}),
-            mock.patch("urllib.request.urlopen", side_effect=OSError),
-        ):
-            self.assertEqual(board.image_digest(), "n/a")
-
-    def test_image_uri_never_shown(self) -> None:
-        uri = "123456789012.dkr.ecr.ap-southeast-1.amazonaws.com/sis-dev-app@sha256:aa"
-
-        class Resp:
-            def __enter__(self) -> "Resp":
-                return self
-
-            def __exit__(self, *a: object) -> None:
-                return None
-
-            def read(self) -> bytes:
-                return json.dumps({"Image": uri, "ImageID": "sha256:bb"}).encode()
-
-        with (
-            mock.patch.dict(os.environ, {"ECS_CONTAINER_METADATA_URI_V4": "http://x"}),
-            mock.patch("urllib.request.urlopen", return_value=Resp()),
-        ):
+    def test_version_digest_from_env(self) -> None:
+        with mock.patch.dict(os.environ, {"IMAGE_DIGEST": DIGEST}):
             for path in ("/", "/version"):
-                body = get(self.port, path)[1]
-                self.assertIn("sha256:bb", body)
-                self.assertNotIn("dkr.ecr", body)
-                self.assertNotIn("123456789012", body)
+                self.assertIn(DIGEST, get(self.port, path)[1])
+            self.assertEqual(json.loads(get(self.port, "/version")[1])["image_digest"], DIGEST)
+
+    def test_invalid_digest_is_na(self) -> None:
+        uri = "123456789012.dkr.ecr.ap-southeast-1.amazonaws.com/sis-dev-app@" + DIGEST
+        for bad in (uri, "sha256:deadbeef", DIGEST.upper(), DIGEST + "\n", "<b>"):
+            with mock.patch.dict(os.environ, {"IMAGE_DIGEST": bad}):
+                self.assertEqual(board.image_digest(), "n/a")
+                self.assertNotIn("123456789012", get(self.port, "/version")[1])
+
+
+class ApiKeyTest(unittest.TestCase):
+    env = {
+        "APP_ENV": "dev",
+        "APP_API_KEY_SECRET_ARN": ARN,
+        "AWS_ACCESS_KEY_ID": "AKIDTEST",
+        "AWS_SECRET_ACCESS_KEY": "fake-secret-key",
+        "AWS_SESSION_TOKEN": "fake-session-token",
+        "AWS_REGION": "ap-southeast-1",
+    }
+
+    def setUp(self) -> None:
+        patcher = mock.patch.dict(os.environ, self.env, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        board._secret_cache.clear()
+        self.addCleanup(board._secret_cache.clear)
+
+    def use(self, fake: FakeSecretsManager) -> FakeSecretsManager:
+        patcher = mock.patch.object(board, "_SECRETS_ENDPOINT", fake.url)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return fake.start(self)
+
+    def test_local_key_wins_without_network(self) -> None:
+        with (
+            mock.patch.dict(os.environ, {"APP_API_KEY": KEY}),
+            mock.patch("aws_sigv4.get_secret_value", side_effect=AssertionError("network")),
+        ):
+            self.assertEqual(board.api_key(), KEY)
+
+    def test_no_key_and_no_arn_is_empty(self) -> None:
+        with mock.patch.dict(os.environ, {"APP_API_KEY_SECRET_ARN": ""}):
+            self.assertEqual(board.api_key(), "")
+
+    def test_secret_read_once_and_cached(self) -> None:
+        fake = self.use(FakeSecretsManager())
+        self.assertEqual(board.api_key(), "s3cret")
+        self.assertEqual(board.api_key(), "s3cret")
+        self.assertEqual(len(fake.requests), 1)
+        self.assertEqual(json.loads(fake.requests[0][1]), {"SecretId": ARN})
+
+    def test_failed_read_is_empty_logged_without_secret_and_retried_later(self) -> None:
+        fake = self.use(FakeSecretsManager(status=400, payload={"__type": "AccessDenied"}))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(board.api_key(), "")
+            self.assertEqual(board.api_key(), "")
+        self.assertEqual(out.getvalue(), "secret read failed: HTTPError\n")
+        self.assertEqual(len(fake.requests), 1)
+        fake.status, fake.payload = 200, {"SecretString": "s3cret"}
+        later = time.monotonic() + board.SECRET_RETRY_SECONDS + 1
+        with mock.patch("time.monotonic", return_value=later):
+            self.assertEqual(board.api_key(), "s3cret")
+        self.assertEqual(len(fake.requests), 2)
+
+    def test_admin_and_index_with_fetched_key(self) -> None:
+        self.use(FakeSecretsManager())
+        server = board.make_server(0)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        status, body = get(port, "/admin", {"X-API-Key": "s3cret"})
+        self.assertEqual(status, 200)
+        self.assertNotIn("s3cret", body)
+        self.assertEqual(get(port, "/admin", {"X-API-Key": "wrong"})[0], 401)
+        page = get(port, "/")[1]
+        self.assertIn("secret_loaded: yes", page)
+        self.assertNotIn("s3cret", page)
+        self.assertNotIn(ARN, page)
 
 
 class SigtermTest(unittest.TestCase):
