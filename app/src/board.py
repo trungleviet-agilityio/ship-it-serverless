@@ -35,8 +35,10 @@ def image_digest() -> str:
 
 
 def api_key() -> str:
-    """APP_API_KEY if set (local, tests), else the secret read once with the execution role."""
-    local = os.environ.get("APP_API_KEY")
+    """APP_API_KEY off Lambda (local, tests), else the secret read once with the execution role."""
+    # On Lambda a plain APP_API_KEY is ignored: whoever can change the function configuration could
+    # plant one, and the read-only plan role can read env values (ADR 0012 L5, review M2).
+    local = "" if os.environ.get("AWS_LAMBDA_FUNCTION_NAME") else os.environ.get("APP_API_KEY")
     if local:
         return local
     arn = os.environ.get("APP_API_KEY_SECRET_ARN")

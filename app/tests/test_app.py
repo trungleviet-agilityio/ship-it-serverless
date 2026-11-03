@@ -153,6 +153,22 @@ class ApiKeyTest(unittest.TestCase):
         ):
             self.assertEqual(board.api_key(), KEY)
 
+    def test_local_key_is_ignored_on_lambda(self) -> None:
+        fake = self.use(FakeSecretsManager())
+        env = {"APP_API_KEY": "planted", "AWS_LAMBDA_FUNCTION_NAME": "sls-dev-app"}
+        with mock.patch.dict(os.environ, env):
+            self.assertEqual(board.api_key(), "s3cret")
+        self.assertEqual(len(fake.requests), 1)
+
+    def test_planted_key_without_secret_on_lambda_is_empty(self) -> None:
+        env = {
+            "APP_API_KEY": "planted",
+            "AWS_LAMBDA_FUNCTION_NAME": "sls-dev-app",
+            "APP_API_KEY_SECRET_ARN": "",
+        }
+        with mock.patch.dict(os.environ, env):
+            self.assertEqual(board.api_key(), "")
+
     def test_no_key_and_no_arn_is_empty(self) -> None:
         with mock.patch.dict(os.environ, {"APP_API_KEY_SECRET_ARN": ""}):
             self.assertEqual(board.api_key(), "")
