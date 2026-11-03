@@ -224,8 +224,8 @@ deleted image (Finding 7).
 `function:<prefix>-<env>-*`; API Gateway on `/apis` and `/apis/*` and `/tags/*` of this region; logs on
 `/aws/lambda/<prefix>-<env>-*` and `/aws/apigateway/<prefix>-<env>-*` plus the log-delivery actions HTTP API access
 logging needs; CloudWatch alarms `<prefix>-<env>-*`; ECR read (`DescribeImages`, `DescribeRepositories`) on the one
-repository for the data source; the secret shell; IAM role CRUD on `<prefix>-<env>-app-*` with the bootstrap
-boundary required; `iam:PassRole` **only** on `<prefix>-<env>-app-exec` with `iam:PassedToService =
+repository for the data source; the secret shell; IAM role CRUD on exactly `<prefix>-<env>-app-exec` (no wildcard
+role pattern, test M1) with the bootstrap boundary required; `iam:PassRole` **only** on `<prefix>-<env>-app-exec` with `iam:PassedToService =
 lambda.amazonaws.com`. EC2, ELB, ECS and ECR-write statements are deleted. Plan role unchanged.
 
 **Execution role** `<prefix>-<env>-app-exec` (Terraform, under the renamed boundary `<prefix>-<env>-app-boundary`):
@@ -242,8 +242,9 @@ secret. Not `AWSLambdaBasicExecutionRole` (it allows `logs:CreateLogGroup` on `*
 
 **Choice: first row.** Logs: `/aws/lambda/<prefix>-<env>-app` and `/aws/apigateway/<prefix>-<env>-api`, 7 days,
 created by Terraform. Alarms (1-minute periods, `treat_missing_data = notBreaching`): Lambda `Errors` on the alias,
-Lambda `Throttles`, HTTP API `5xx`. Actions go to the bootstrap SNS topic `<prefix>-<env>-security-alerts` when the
-env passes it. `reserved_concurrency` defaults to `null` (off); set it in tfvars where the quota allows.
+Lambda `Throttles`, HTTP API `5xx`. Actions go to the bootstrap SNS topic `<prefix>-<env>-security-alerts`; its topic policy
+allows `cloudwatch.amazonaws.com` scoped by the alarm ARN pattern. The env builds the topic ARN from its name: a
+`data "aws_sns_topic"` lookup would need `sns:*` reads that guardrail G6 denies to every CI role. `reserved_concurrency` defaults to `null` (off); set it in tfvars where the quota allows.
 
 ### L11. ECS in this repository
 
