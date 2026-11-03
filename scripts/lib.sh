@@ -253,3 +253,25 @@ DEFAULT_KEEP_VERSIONS=10
 # valid_sha <value> / valid_digest <value>: a full commit SHA (40 hex) and an image digest (sha256:<64 hex>).
 valid_sha() { [[ "$1" =~ ^[0-9a-f]{40}$ ]]; }
 valid_digest() { [[ "$1" =~ ^sha256:[0-9a-f]{64}$ ]]; }
+
+# The HTTP API endpoint (ADR 0012 L2): https://<10 character API ID>.execute-api.<region>.amazonaws.com, nothing
+# before or after. It holds no account ID, so it may travel as a job output to the credential-free verify job.
+API_ENDPOINT_RE='^https://[a-z0-9]{10}\.execute-api\.[a-z0-9-]+\.amazonaws\.com$'
+valid_api_endpoint() { [[ "$1" =~ $API_ENDPOINT_RE ]]; }
+
+# lambda_http_event <path> <client name>: an API Gateway HTTP API payload v2.0 event for GET <path>, the shape the HTTP
+# API sends, so the Lambda Web Adapter forwards it to the app as a GET request. No account ID: accountId is "anonymous".
+# smoke-invoke.sh (one version) and canary-bake.sh (the alias) send the same event.
+lambda_http_event() {
+  jq -cn --arg path "$1" --arg client "$2" --arg id "$2-$RANDOM" --argjson now "$(date +%s)" '{
+    version: "2.0", routeKey: "$default", rawPath: $path, rawQueryString: "",
+    headers: {accept: "application/json", host: ($client + ".invalid"), "user-agent": $client},
+    requestContext: {
+      accountId: "anonymous", apiId: "smoke", domainName: ($client + ".invalid"), domainPrefix: $client,
+      http: {method: "GET", path: $path, protocol: "HTTP/1.1", sourceIp: "127.0.0.1", userAgent: $client},
+      requestId: $id, routeKey: "$default", stage: "$default",
+      time: ($now | strftime("%d/%b/%Y:%H:%M:%S +0000")), timeEpoch: ($now * 1000)
+    },
+    isBase64Encoded: false
+  }'
+}

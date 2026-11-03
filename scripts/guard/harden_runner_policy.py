@@ -9,16 +9,17 @@ or with no hardening.
 Rules, per job:
   1. the first step is step-security/harden-runner, with no `if:` and no `continue-on-error:`;
   2. a job with `id-token: write` has `egress-policy: block`, `disable-telemetry: true` and
-     `disable-sudo-and-containers: true` (except the jobs in NEEDS_CONTAINERS), and no
-     `container:` or `services:`;
+     `disable-sudo-and-containers: true`, and no `container:` or `services:`. There is no
+     exception: the app deploy pushes with crane, not Docker (ADR 0012 L7, review L6);
   3. any other job has `egress-policy: audit`;
   4. every allowed endpoint is `host:port` and holds no 12-digit literal (an account ID);
-  5. in a credentialed job an endpoint holds no `*`, and the only expressions are the ones in
-     ALLOWED_EXPRESSIONS (account hosts come from the secret, never from a literal), plus
+  5. in a credentialed job an endpoint holds no `*` at all, and the only expressions are the
+     ones in ALLOWED_EXPRESSIONS (account hosts come from the secret, never from a literal), plus
      `secrets.AWS_ACCOUNT_ID_DEV` in the jobs of SOURCE_REGISTRY_JOBS only (the promotion source
-     registry host, ADR 0008 P8). One wildcard is allowed, exactly as EXECUTE_API_WILDCARD and only
-     in the jobs of EXECUTE_API_JOBS: the HTTP API host holds an API ID that exists only after
-     terraform apply, and the deploy probes the API (ADR 0012 L7);
+     registry host, ADR 0008 P8). No wildcard family is excepted: an `*.execute-api` host would
+     reach the API of any account with deploy credentials, so the canary probes invoke the alias
+     through the Lambda API and the front-door check runs in a job without credentials (ADR 0012
+     L7, review M1);
   6. `env.ENV` in a credentialed job names the environment, so ENV must be a literal, or exactly
      `inputs.env` (optionally `|| '<literal>'`) where `env` is a `choice` input of
      workflow_dispatch (a workflow_call input in a reusable-*.yml file). A branch name, free text
@@ -69,20 +70,10 @@ VARS_REF = re.compile(r"^vars\.[A-Za-z_][A-Za-z0-9_]*$")
 ENV_FROM_INPUT = re.compile(r"^\$\{\{\s*inputs\.env(?:\s*\|\|\s*'([^']*)')?\s*\}\}$")
 ENV_NAME = re.compile(r"^[a-z][a-z0-9]{1,7}$")  # lib.sh ENV_NAME_RE
 REUSABLE_CALL = re.compile(r"^\./\.github/workflows/reusable-[A-Za-z0-9._-]+\.ya?ml$")
-# The one credentialed job that needs Docker (docker load and docker push), so it cannot disable
-# containers. The residual risk is recorded in ADR 0007. Keyed by (workflow file name, job id).
-NEEDS_CONTAINERS = (("app-deploy.yml", "deploy"),)
 # The one credentialed job that reads a second account: app-promote pulls from the dev registry,
 # whose host holds the dev account ID (ADR 0008 P8, P9). Keyed by (workflow file name, job id).
 SOURCE_REGISTRY_JOBS = (("app-promote.yml", "promote"),)
 SOURCE_REGISTRY_EXPRESSION = "secrets.AWS_ACCOUNT_ID_DEV"
-# The one wildcard family (ADR 0012 L7): the deploy jobs send canary probes and the live check
-# through the HTTP API, whose host `<api id>.execute-api.<region>.amazonaws.com` is only known
-# after terraform apply creates the API (a re-created API gets a new ID). The wildcard covers
-# execute-api hosts of the job's region only, never a whole domain, and only this exact text in
-# these two jobs is accepted. Keyed by (workflow file name, job id).
-EXECUTE_API_JOBS = (("app-deploy.yml", "deploy"), ("app-promote.yml", "promote"))
-EXECUTE_API_WILDCARD = "*.execute-api.${{ vars.AWS_REGION }}.amazonaws.com:443"
 
 
 def _has_id_token(permissions: Any) -> bool:
@@ -137,7 +128,6 @@ def _endpoint_problems(
     credentialed: bool,
     env: dict[str, Any],
     allowed: tuple[str, ...],
-    execute_api: bool = False,
 ) -> list[str]:
     problems: list[str] = []
     expressions = EXPRESSION.findall(endpoint)
@@ -147,7 +137,7 @@ def _endpoint_problems(
     if ACCOUNT_ID.search(literal):
         problems.append("an endpoint holds a 12-digit literal (build it from a secret expression)")
     if credentialed:
-        if "*" in literal and not (execute_api and endpoint == EXECUTE_API_WILDCARD):
+        if "*" in literal:
             problems.append(f"endpoint '{endpoint}' holds a wildcard (list exact hosts)")
         problems.extend(
             f"endpoint '{endpoint}' uses the expression '{e}' (allowed: {', '.join(allowed)})"
@@ -202,11 +192,9 @@ def _env_value_problem(value: Any, document: Any, reusable: bool) -> str | None:
 def _step_problems(
     step: Any,
     credentialed: bool,
-    needs_containers: bool,
     env: dict[str, Any],
     env_problem: str | None,
     allowed: tuple[str, ...] = ALLOWED_EXPRESSIONS,
-    execute_api: bool = False,
 ) -> list[str]:
     uses = step.get("uses") if isinstance(step, dict) else None
     if not isinstance(uses, str) or not uses.startswith(ACTION):
@@ -218,9 +206,7 @@ def _step_problems(
     with_ = with_ if isinstance(with_, dict) else {}
     policy = with_.get("egress-policy")
     if credentialed:
-        required = ["disable-telemetry"]
-        if not needs_containers:
-            required.append("disable-sudo-and-containers")
+        required = ("disable-telemetry", "disable-sudo-and-containers")
         if policy != "block":
             problems.append("has id-token: write, so egress-policy must be block")
         problems.extend(
@@ -233,7 +219,7 @@ def _step_problems(
     endpoints = with_.get("allowed-endpoints")
     found = ENDPOINT.findall(endpoints if isinstance(endpoints, str) else "")
     for endpoint in found:
-        problems.extend(_endpoint_problems(endpoint, credentialed, env, allowed, execute_api))
+        problems.extend(_endpoint_problems(endpoint, credentialed, env, allowed))
     uses_env = any("env.ENV" in EXPRESSION.findall(e) for e in found)
     if credentialed and uses_env and env_problem:
         problems.append(f"an endpoint uses env.ENV, but {env_problem}")
@@ -289,16 +275,12 @@ def check(shown: str, document: Any) -> list[str]:
         credentialed = _has_id_token(job.get("permissions", workflow_permissions))
         steps = job.get("steps")
         first = steps[0] if isinstance(steps, list) and steps else None
-        needs_containers = (os.path.basename(shown), job_id) in NEEDS_CONTAINERS
         merged = _merged_env(document, job, first)
         env_problem = _env_value_problem(merged.get("ENV"), document, reusable)
         allowed = ALLOWED_EXPRESSIONS
         if (os.path.basename(shown), job_id) in SOURCE_REGISTRY_JOBS:
             allowed = (*ALLOWED_EXPRESSIONS, SOURCE_REGISTRY_EXPRESSION)
-        execute_api = (os.path.basename(shown), job_id) in EXECUTE_API_JOBS
-        messages += _step_problems(
-            first, credentialed, needs_containers, merged, env_problem, allowed, execute_api
-        )
+        messages += _step_problems(first, credentialed, merged, env_problem, allowed)
         if credentialed:
             messages += [
                 f"has id-token: write, so `{k}:` is not allowed"

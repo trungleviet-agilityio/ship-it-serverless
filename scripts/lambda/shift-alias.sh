@@ -4,8 +4,14 @@
 #   <version>                    all at once: `live` points at <version>, with no additional weights;
 #   <version> --weight <pct>     canary: `live` keeps its primary version and sends <pct> percent (1 to 50) to <version>;
 #   --clear-weights              abort a canary: the additional weights are removed, the primary keeps 100 percent.
-# A canary refuses a <version> that is already the primary. Prints the alias state on stdout as key=value lines
-# (ALIAS_VERSION=<primary>, ALIAS_WEIGHTS=<json of the additional weights>), ready to append to $GITHUB_OUTPUT.
+# A release to the version that is already the primary is a no-op (a rollback or a re-run of a version that is live):
+# all at once changes nothing when `live` already points at <version> with no additional weights, and a canary never
+# weights the primary (that would be AdditionalVersionWeights on the version that already gets the rest); both print a
+# notice and exit 0 without UpdateAlias. All at once to the primary while another version still has a weight clears
+# that weight.
+# Prints the alias state on stdout as key=value lines (ALIAS_VERSION=<primary>, ALIAS_WEIGHTS=<json of the additional
+# weights>, ALIAS_CHANGED=<true|false>), ready to append to $GITHUB_OUTPUT. ALIAS_CHANGED=false tells the workflow to
+# skip the canary bake.
 #
 # Usage: ENV=dev scripts/lambda/shift-alias.sh <version> [--weight <pct>]
 #        ENV=dev scripts/lambda/shift-alias.sh --clear-weights
@@ -39,15 +45,34 @@ alias_call() {
   printf '%s' "$RUN_OUT" | jq -e '.FunctionVersion | type == "string"' >/dev/null 2>&1 || die "${2} ${3} returned no alias"
 }
 
+# noop <reason>: the alias is already in the asked state: print it and stop.
+noop() {
+  local weights
+  weights="$(printf '%s' "$RUN_OUT" | jq -c '.RoutingConfig.AdditionalVersionWeights // {}')"
+  if [ -n "${GITHUB_ACTIONS:-}" ]; then printf '::notice::%s\n' "$1" >&2; else log "$1"; fi
+  printf 'ALIAS_VERSION=%s\nALIAS_WEIGHTS=%s\nALIAS_CHANGED=false\n' "$version" "$weights"
+  exit 0
+}
+
+if [ "$mode" != clear ]; then
+  alias_call aws lambda get-alias --function-name "$FUNCTION" --name "$ALIAS" --output json
+  primary="$(printf '%s' "$RUN_OUT" | jq -r '.FunctionVersion')"
+  current_weights="$(printf '%s' "$RUN_OUT" | jq -c '.RoutingConfig.AdditionalVersionWeights // {}')"
+  if [ "$primary" = "$version" ]; then
+    if [ "$mode" = weight ]; then
+      noop "version ${version} is already the primary of ${ALIAS}: nothing to canary, the alias is unchanged"
+    elif [ "$current_weights" = "{}" ]; then
+      noop "version ${version} is already the primary of ${ALIAS} with no additional weights: nothing to move"
+    fi
+  fi
+fi
+
 case "$mode" in
   all)
     alias_call aws lambda update-alias --function-name "$FUNCTION" --name "$ALIAS" --function-version "$version" \
       --routing-config '{"AdditionalVersionWeights":{}}' --output json
     ;;
   weight)
-    alias_call aws lambda get-alias --function-name "$FUNCTION" --name "$ALIAS" --output json
-    primary="$(printf '%s' "$RUN_OUT" | jq -r '.FunctionVersion')"
-    [ "$primary" != "$version" ] || die "version ${version} is already the primary of ${ALIAS}: nothing to canary"
     weights="$(jq -cn --arg v "$version" --argjson p "$pct" '{AdditionalVersionWeights: {($v): ($p / 100)}}')"
     alias_call aws lambda update-alias --function-name "$FUNCTION" --name "$ALIAS" --function-version "$primary" \
       --routing-config "$weights" --output json
@@ -70,4 +95,4 @@ case "$mode" in
   clear) [ "$weights" = "{}" ] || die "the additional weights were not removed: ${weights}" ;;
 esac
 ok "${ALIAS} -> version ${primary}, additional weights ${weights}"
-printf 'ALIAS_VERSION=%s\nALIAS_WEIGHTS=%s\n' "$primary" "$weights"
+printf 'ALIAS_VERSION=%s\nALIAS_WEIGHTS=%s\nALIAS_CHANGED=true\n' "$primary" "$weights"

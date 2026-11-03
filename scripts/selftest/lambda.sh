@@ -142,15 +142,24 @@ versions_json() {
   for v in "$@"; do out="${out},{\"Version\":\"${v%%:*}\",\"Description\":\"${v#*:}\"}"; done
   printf '%s]}' "$out"
 }
+# versions_with_env <version> <description> <IMAGE_DIGEST>: the answer of list-versions-by-function with one numbered
+# version that carries its environment (ListVersionsByFunction returns each version's configuration).
+versions_with_env() {
+  jq -cn --arg latest "$latest" --arg v "$1" --arg desc "$2" --argjson env "$(fn_env dev "$3")" \
+    '{Versions: [{Version: $latest, Description: ""}, {Version: $v, Description: $desc, Environment: {Variables: $env}}]}'
+}
 # version_json <description> <digest of the image> <IMAGE_DIGEST>: the answer of get-function --qualifier.
 version_json() {
   printf '{"Code":{"RepositoryType":"ECR","ImageUri":"%s@%s","ResolvedImageUri":"%s@%s"},"Configuration":{"Version":"4","Description":"%s","Environment":{"Variables":%s}}}' \
     "$repo_uri" "$2" "$repo_uri" "$2" "$1" "$(fn_env dev "$3")"
 }
+# fn_config <APP_ENV> <IMAGE_DIGEST> <description>: the answer of get-function-configuration (environment and description).
+fn_config() { jq -cn --argjson v "$(fn_env "$1" "$2")" --arg d "$3" '{Variables: $v, Description: $d}'; }
+tf_desc="initial image (terraform)"
 publish_ready() {
   stub_reset
   stub aws-lambda-list-versions-by-function out "$(versions_json "3:sha=${other_sha} digest=${other_d}")"
-  stub aws-lambda-get-function-configuration out "$(fn_env dev "$other_d")"
+  stub aws-lambda-get-function-configuration out "$(fn_config dev "$other_d" "sha=${other_sha} digest=${other_d}")"
   stub aws-lambda-update-function-code out InProgress
   stub aws-lambda-update-function-configuration out InProgress
   stub aws-lambda-publish-version out 4
@@ -163,14 +172,17 @@ no_acct "$out$(cat "$tmp/publish.err")" "publish"
 calls_have "update-function-code --function-name sis-dev-app --image-uri ${repo_uri}@${d}" || die "selftest: the code must be updated by digest"
 calls_have "publish-version --function-name sis-dev-app --description ${desc}" || die "selftest: the version must carry sha= and digest="
 calls_have "wait published-version-active --function-name sis-dev-app --qualifier 4" || die "selftest: publish must wait for the version"
-# The merged environment: every Terraform key unchanged, IMAGE_DIGEST replaced.
-env_arg="$(grep 'update-function-configuration' "$sd/calls" | sed 's/.*--environment //; s/ --query.*//')"
+# One configuration update: every Terraform key unchanged, IMAGE_DIGEST replaced, and the description of the commit.
+[ "$(grep -c 'update-function-configuration' "$sd/calls")" = 1 ] || die "selftest: publish must update the configuration exactly once"
+config_call="$(grep 'update-function-configuration' "$sd/calls")"
+env_arg="$(sed 's/.*--environment //; s/ --description.*//' <<<"$config_call")"
 jq -e --argjson want "$(fn_env dev "$d")" '.Variables == $want' <<<"$env_arg" >/dev/null || die "selftest: the merged environment is wrong: $env_arg"
-# Order: code, wait, configuration, wait, publish (ADR 0012 L6: the digest is set before PublishVersion).
+case "$config_call" in *"--description ${desc} --query"*) ;; *) die "selftest: the configuration update must set the description: $config_call" ;; esac
+# Order: code, wait, configuration (digest and description), wait, publish (ADR 0012 L6, L7: both before PublishVersion).
 order="$(grep -oE 'lambda (update-function-code|update-function-configuration|publish-version|wait function-updated-v2)' "$sd/calls" | tr '\n' ',')"
 [ "$order" = "lambda update-function-code,lambda wait function-updated-v2,lambda update-function-configuration,lambda wait function-updated-v2,lambda publish-version," ] \
   || die "selftest: publish ran its calls in the wrong order: $order"
-ok "publish: code by digest, IMAGE_DIGEST merged before PublishVersion, version proven"
+ok "publish: code by digest, IMAGE_DIGEST and the description in one update before PublishVersion, version proven"
 
 # Rollback and re-run: a version with the exact description is reused, nothing changes.
 publish_ready
@@ -191,25 +203,61 @@ expect_fail "a reused version with another image" "its resolved image is not @${
 no_acct "$EXPECT_OUT" "the refused reuse"
 ok "publish: the rollback path reuses the exact version and proves it"
 
+# B1, the first deploy after terraform apply: Terraform published version 1 with its own description and the same
+# digest. The lookup finds it by IMAGE_DIGEST and reuses it with a warning; nothing is changed.
+publish_ready
+stub aws-lambda-list-versions-by-function out "$(versions_with_env 1 "$tf_desc" "$d")"
+stub aws-lambda-get-function out "$(version_json "$tf_desc" "$d" "$d")"
+out="$(publish "$repo_uri" "$d" "$commit" 2>"$tmp/publish.err")" || die "selftest: the first deploy after terraform failed: $(cat "$tmp/publish.err")"
+[ "$out" = "$(printf 'VERSION=1\nREUSED=true')" ] || die "selftest: the first deploy after terraform printed: $out"
+grep -qF "its description is \"${tf_desc}\"" "$tmp/publish.err" || die "selftest: a version reused by its digest must be reported with a warning"
+! grep -qE 'update-function-code|update-function-configuration|publish-version' "$sd/calls" || die "selftest: a version reused by its digest must change nothing"
+# The same version without its environment in the list: publish runs, and PublishVersion returns version 1 (nothing
+# changed since it was published). Image and IMAGE_DIGEST match, so it is accepted as reused, with the warning.
+publish_ready
+stub aws-lambda-list-versions-by-function out "$(versions_json "1:${tf_desc}")"
+stub aws-lambda-publish-version out 1
+stub aws-lambda-get-function out "$(version_json "$tf_desc" "$d" "$d")"
+out="$(publish "$repo_uri" "$d" "$commit" 2>"$tmp/publish.err")" || die "selftest: a publish that returned the Terraform version failed: $(cat "$tmp/publish.err")"
+[ "$out" = "$(printf 'VERSION=1\nREUSED=true')" ] || die "selftest: a publish that returned the Terraform version printed: $out"
+grep -qF "its description is \"${tf_desc}\"" "$tmp/publish.err" || die "selftest: a returned older version must be reported with a warning"
+# The description match wins over a digest match, and a digest match with another image is still refused.
+publish_ready
+stub aws-lambda-list-versions-by-function out "$(jq -c --arg desc "$desc" '.Versions += [{Version: "2", Description: $desc}]' <<<"$(versions_with_env 5 "$tf_desc" "$d")")"
+[ "$(publish "$repo_uri" "$d" "$commit" 2>/dev/null)" = "$(printf 'VERSION=2\nREUSED=true')" ] || die "selftest: the version with our description must win over a digest match"
+publish_ready
+stub aws-lambda-list-versions-by-function out "$(versions_with_env 1 "$tf_desc" "$d")"
+stub aws-lambda-get-function out "$(version_json "$tf_desc" "$other_d" "$d")"
+expect_fail "a digest match whose image is another digest" "version 1 refused: its resolved image is not @${d}" publish "$repo_uri" "$d" "$commit"
+publish_ready
+stub aws-lambda-list-versions-by-function out "$(versions_with_env 1 "$tf_desc" "$other_d")"
+[ "$(publish "$repo_uri" "$d" "$commit" 2>/dev/null)" = "$(printf 'VERSION=4\nREUSED=false')" ] || die "selftest: a version of another digest must not be reused"
+ok "publish: a version Terraform published with the same digest is reused (B1)"
+
 # The environment must be Terraform's: refused before any change.
 publish_ready
-stub aws-lambda-get-function-configuration out "$(fn_env prod)"
+stub aws-lambda-get-function-configuration out "$(fn_config prod "" "")"
 expect_fail "publish to a function whose APP_ENV is another env" "APP_ENV must be dev" publish "$repo_uri" "$d" "$commit"
 ! calls_have "update-function-code" || die "selftest: a foreign environment must be refused before the code update"
 publish_ready
-stub aws-lambda-get-function-configuration out null
+stub aws-lambda-get-function-configuration out '{"Variables":null,"Description":""}'
 expect_fail "publish to a function without environment" "has no environment variables" publish "$repo_uri" "$d" "$commit"
 publish_ready
-stub aws-lambda-get-function-configuration out "$(fn_env dev "$d")"
-publish "$repo_uri" "$d" "$commit" >/dev/null 2>&1 || die "selftest: publish with IMAGE_DIGEST already set failed"
-! calls_have "update-function-configuration" || die "selftest: an unchanged IMAGE_DIGEST must not update the configuration"
-# PublishVersion returns an existing version when nothing changed: its description then differs.
+stub aws-lambda-get-function-configuration out "$(fn_config dev "$d" "$desc")"
+publish "$repo_uri" "$d" "$commit" >/dev/null 2>&1 || die "selftest: publish with IMAGE_DIGEST and the description already set failed"
+! calls_have "update-function-configuration" || die "selftest: an unchanged IMAGE_DIGEST and description must not update the configuration"
+# The digest is set but the description is Terraform's: the update still runs, for the description.
 publish_ready
-stub aws-lambda-get-function out "$(version_json "sha=${other_sha} digest=${d}" "$d" "$d")"
-expect_fail "publish that returned an older version" "PublishVersion returned an existing version" publish "$repo_uri" "$d" "$commit"
+stub aws-lambda-get-function-configuration out "$(fn_config dev "$d" "$tf_desc")"
+publish "$repo_uri" "$d" "$commit" >/dev/null 2>&1 || die "selftest: publish with only IMAGE_DIGEST set failed"
+calls_have "update-function-configuration --function-name sis-dev-app --environment" || die "selftest: a stale description must be updated"
+calls_have "--description ${desc} --query LastUpdateStatus" || die "selftest: the description update must carry sha= and digest="
 publish_ready
 stub aws-lambda-get-function out "$(version_json "$desc" "$d" "n/a")"
 expect_fail "a version without its IMAGE_DIGEST" "its IMAGE_DIGEST is not ${d}" publish "$repo_uri" "$d" "$commit"
+publish_ready
+stub aws-lambda-get-function out "$(version_json "sha=${other_sha} digest=${other_d}" "$other_d" "$other_d")"
+expect_fail "publish that returned a version of another image" "its resolved image is not @${d}" publish "$repo_uri" "$d" "$commit"
 publish_ready
 stub aws-lambda-publish-version out "$latest"
 expect_fail "publish-version without a number" "not a version number" publish "$repo_uri" "$d" "$commit"
@@ -284,41 +332,105 @@ smoke_ready
 stub aws-lambda-invoke rc 254
 stub aws-lambda-invoke err "An error occurred (AccessDeniedException) for ${acct}"
 expect_fail "a denied invoke" "failed (exit code 254): An error occurred (AccessDeniedException) for <redacted>" smoke 4 "$commit" "$d"
+# C2: a cold start may fail the invoke itself or answer a FunctionError; both are retried (bounded), on /version too.
+smoke_ready
+stub aws-lambda-invoke out '{"StatusCode":200,"FunctionError":"Unhandled","ExecutedVersion":"4"}' 0
+stub aws-lambda-invoke payload '{"errorMessage":"init timeout","errorType":"Runtime.Unknown"}' 0
+stub aws-lambda-invoke payload '{"statusCode":200,"body":"ok"}' 1
+stub aws-lambda-invoke payload "{\"statusCode\":200,\"body\":$(version_body "$commit" "$d")}" 2
+smoke 4 "$commit" "$d" >/dev/null 2>&1 || die "selftest: one FunctionError on /health (cold start) must be retried"
+[ "$(cat "$sd/aws-lambda-invoke.n")" = 3 ] || die "selftest: a retried FunctionError must cost exactly one more invoke"
+smoke_ready
+stub aws-lambda-invoke rc 255 1
+stub aws-lambda-invoke err "An error occurred (ResourceConflictException): The operation cannot be performed at this time. The function is currently in the following state: Pending" 1
+stub aws-lambda-invoke payload "{\"statusCode\":200,\"body\":$(version_body "$commit" "$d")}" 2
+smoke 4 "$commit" "$d" >/dev/null 2>&1 || die "selftest: one failed invoke of /version (Pending) must be retried"
+smoke_ready
+stub aws-lambda-invoke out '{"StatusCode":200,"FunctionError":"Unhandled","ExecutedVersion":"4"}'
+expect_fail "a version that keeps answering a FunctionError" "failed GET /health 3 time(s): FunctionError Unhandled" smoke 4 "$commit" "$d"
+[ "$(cat "$sd/aws-lambda-invoke.n")" = 3 ] || die "selftest: the FunctionError retries must stop after SMOKE_ATTEMPTS"
+smoke_ready
+stub aws-lambda-invoke rc 255
+stub aws-lambda-invoke err "Read timeout on endpoint URL for ${acct}"
+expect_fail "a version whose invoke keeps failing" "failed GET /health 3 time(s): the invoke failed (exit code 255): Read timeout on endpoint URL for <redacted>" smoke 4 "$commit" "$d"
+no_acct "$EXPECT_OUT" "the failed invoke retries"
+# The backoff is injectable (SMOKE_RETRY_SLEEP, 0 here) and each retry is logged with its attempt.
+smoke_ready
+stub aws-lambda-invoke rc 255
+out="$(trap - ERR; stubbed env ENV=dev SMOKE_RETRY_SLEEP=0 SMOKE_ATTEMPTS=2 "$ROOT/scripts/lambda/smoke-invoke.sh" 4 "$commit" "$d" 2>&1)" && die "selftest: a failing invoke must fail the smoke"
+[ "$(cat "$sd/aws-lambda-invoke.n")" = 2 ] || die "selftest: SMOKE_ATTEMPTS=2 must invoke twice"
+case "$out" in *"attempt 1 of 2"*) ;; *) die "selftest: a retry must be logged with its attempt: $out" ;; esac
+# A clean non-2xx is never retried more than before: /version is judged on its first clean answer.
+smoke_ready
+stub aws-lambda-invoke payload '{"statusCode":503,"body":"x"}' 1
+expect_fail "a version whose /version is 503" "GET /version answered 503, expected 200" smoke 4 "$commit" "$d"
+[ "$(cat "$sd/aws-lambda-invoke.n")" = 2 ] || die "selftest: a clean 503 on /version must not be retried"
+# An AccessDeniedException never heals: no retry.
+smoke_ready
+stub aws-lambda-invoke rc 254
+stub aws-lambda-invoke err "An error occurred (AccessDeniedException) for ${acct}"
+expect_fail "a denied invoke is not retried" "AccessDeniedException" smoke 4 "$commit" "$d"
+[ "$(cat "$sd/aws-lambda-invoke.n")" = 1 ] || die "selftest: a denied invoke must not be retried"
 expect_fail "a smoke of \$LATEST" "published version number" smoke "$latest" "$commit" "$d"
 expect_fail "a smoke with a bad digest" "sha256:<64 hex>" smoke 4 "$commit" "$digest"
 ok "smoke-invoke fails on errors, wrong answers and bad arguments"
 
 # === shift-alias.sh
 shift_alias() { stubbed env ENV=dev "$ROOT/scripts/lambda/shift-alias.sh" "$@"; }
-alias_json() { printf '{"Name":"live","FunctionVersion":"%s","RoutingConfig":{"AdditionalVersionWeights":%s}}' "$1" "${2:-{\}}"; }
+# Bash 3.2 (macOS) keeps the backslash of "${2:-{\}}", so the default JSON comes from a variable.
+no_weights='{}'
+alias_json() { printf '{"Name":"live","FunctionVersion":"%s","RoutingConfig":{"AdditionalVersionWeights":%s}}' "$1" "${2:-$no_weights}"; }
+[ "$(alias_json 4)" = '{"Name":"live","FunctionVersion":"4","RoutingConfig":{"AdditionalVersionWeights":{}}}' ] || die "selftest: alias_json default weights are not {}"
 stub_reset
+stub aws-lambda-get-alias out "$(alias_json 3)"
 stub aws-lambda-update-alias out "$(alias_json 4)"
-[ "$(shift_alias 4 2>/dev/null)" = "$(printf 'ALIAS_VERSION=4\nALIAS_WEIGHTS={}')" ] || die "selftest: shift-alias all at once printed the wrong state"
+[ "$(shift_alias 4 2>/dev/null)" = "$(printf 'ALIAS_VERSION=4\nALIAS_WEIGHTS={}\nALIAS_CHANGED=true')" ] || die "selftest: shift-alias all at once printed the wrong state"
 calls_have 'update-alias --function-name sis-dev-app --name live --function-version 4 --routing-config {"AdditionalVersionWeights":{}}' \
   || die "selftest: all at once must move the primary and clear the weights"
 stub_reset
 stub aws-lambda-get-alias out "$(alias_json 3)"
 stub aws-lambda-update-alias out "$(alias_json 3 '{"4":0.1}')"
 out="$(shift_alias 4 --weight 10 2>/dev/null)" || die "selftest: the canary shift failed"
-[ "$out" = "$(printf 'ALIAS_VERSION=3\nALIAS_WEIGHTS={"4":0.1}')" ] || die "selftest: the canary shift printed: $out"
+[ "$out" = "$(printf 'ALIAS_VERSION=3\nALIAS_WEIGHTS={"4":0.1}\nALIAS_CHANGED=true')" ] || die "selftest: the canary shift printed: $out"
 calls_have 'update-alias --function-name sis-dev-app --name live --function-version 3 --routing-config {"AdditionalVersionWeights":{"4":0.1}}' \
   || die "selftest: the canary must keep the primary and weight the new version"
 stub_reset
 stub aws-lambda-update-alias out "$(alias_json 3)"
-[ "$(shift_alias --clear-weights 2>/dev/null)" = "$(printf 'ALIAS_VERSION=3\nALIAS_WEIGHTS={}')" ] || die "selftest: clear-weights printed the wrong state"
+[ "$(shift_alias --clear-weights 2>/dev/null)" = "$(printf 'ALIAS_VERSION=3\nALIAS_WEIGHTS={}\nALIAS_CHANGED=true')" ] || die "selftest: clear-weights printed the wrong state"
 calls_have 'update-alias --function-name sis-dev-app --name live --routing-config {"AdditionalVersionWeights":{}}' || die "selftest: clear-weights must remove the weights"
 ! calls_have "--function-version" || die "selftest: clear-weights must not move the primary"
 ok "shift-alias: all at once, canary weight and abort"
+# B1: a release to the version that is already the primary is a no-op, never a weight on the primary.
 stub_reset
 stub aws-lambda-get-alias out "$(alias_json 4)"
-expect_fail "a canary of the primary version" "already the primary" shift_alias 4 --weight 10
-! calls_have "update-alias" || die "selftest: a refused canary must not update the alias"
+out="$(shift_alias 4 --weight 10 2>"$tmp/shift.err")" || die "selftest: a canary of the primary must be a no-op, not a failure: $(cat "$tmp/shift.err")"
+[ "$out" = "$(printf 'ALIAS_VERSION=4\nALIAS_WEIGHTS={}\nALIAS_CHANGED=false')" ] || die "selftest: a canary of the primary printed: $out"
+grep -q "already the primary" "$tmp/shift.err" || die "selftest: a canary of the primary must print a notice"
+! calls_have "update-alias" || die "selftest: a canary of the primary must not update the alias"
+stub_reset
+stub aws-lambda-get-alias out "$(alias_json 4)"
+out="$(GITHUB_ACTIONS=true shift_alias 4 2>"$tmp/shift.err")" || die "selftest: all at once to the primary must be a no-op"
+[ "$out" = "$(printf 'ALIAS_VERSION=4\nALIAS_WEIGHTS={}\nALIAS_CHANGED=false')" ] || die "selftest: all at once to the primary printed: $out"
+grep -q '^::notice::version 4 is already the primary' "$tmp/shift.err" || die "selftest: the no-op must be a notice in GitHub Actions"
+! calls_have "update-alias" || die "selftest: all at once to the primary must not update the alias"
+# All at once to the primary while another version still has a weight: the weight is cleared.
+stub_reset
+stub aws-lambda-get-alias out "$(alias_json 4 '{"5":0.1}')"
+stub aws-lambda-update-alias out "$(alias_json 4)"
+[ "$(shift_alias 4 2>/dev/null)" = "$(printf 'ALIAS_VERSION=4\nALIAS_WEIGHTS={}\nALIAS_CHANGED=true')" ] || die "selftest: all at once must clear a stale weight"
+calls_have 'update-alias --function-name sis-dev-app --name live --function-version 4' || die "selftest: a stale weight must be cleared with update-alias"
+ok "shift-alias: a release to the primary is a no-op with a notice"
 stub_reset
 stub aws-lambda-update-alias out "$(alias_json 3 '{"4":0.1}')"
 expect_fail "a clear that leaves a weight" "were not removed" shift_alias --clear-weights
 stub_reset
+stub aws-lambda-get-alias out "$(alias_json 3)"
 stub aws-lambda-update-alias out "$(alias_json 3)"
 expect_fail "an alias that did not move" "did not move" shift_alias 4
+stub_reset
+stub aws-lambda-get-alias rc 254
+stub aws-lambda-get-alias err "An error occurred (ResourceNotFoundException) for ${acct}"
+expect_fail "shift-alias without the alias" "get-alias failed (exit code 254): An error occurred (ResourceNotFoundException) for <redacted>" shift_alias 4
 for bad in "" "4 --weight" "4 --weight 0" "4 --weight 51" "4 --weight 1.5" "4 --percent 10" "$latest" "live" "4 5"; do
   stub_reset
   # shellcheck disable=SC2086  # the arguments are split on purpose
@@ -327,59 +439,152 @@ for bad in "" "4 --weight" "4 --weight 0" "4 --weight 51" "4 --weight 1.5" "4 --
 done
 ok "shift-alias refuses bad arguments and checks the result"
 
-# === canary-bake.sh
-bake() { stubbed env ENV=dev CANARY_PROBE_INTERVAL=0 CANARY_METRIC_DELAY=0 "$ROOT/scripts/lambda/canary-bake.sh" "$@"; }
+# === canary-bake.sh (probes invoke the alias through the Lambda API; no curl, no execute-api host)
+bake() { stubbed env ENV=dev CANARY_PROBE_INTERVAL=0 CANARY_METRIC_POLL=0 "$ROOT/scripts/lambda/canary-bake.sh" "$@"; }
 datapoints() { printf '{"Label":"x","Datapoints":[{"Sum":%s,"Unit":"Count"},{"Sum":%s,"Unit":"Count"}]}' "$1" "$2"; }
+# served_by <version> <call number> [payload]: the probe with that number is served by <version> (with the payload).
+served_by() {
+  stub aws-lambda-invoke out "{\"StatusCode\":200,\"ExecutedVersion\":\"$1\"}" "$2"
+  if [ -n "${3:-}" ]; then stub aws-lambda-invoke payload "$3" "$2"; fi
+}
+# bake_ready: 12 probes in one minute, served by version 3 except probes 0, 4 and 8 (version 4, the canary); the metric
+# window settles at once (Errors 0, then Invocations 3).
 bake_ready() {
   stub_reset
-  stub curl out 200
+  stub aws-lambda-invoke out '{"StatusCode":200,"ExecutedVersion":"3"}'
+  stub aws-lambda-invoke payload '{"statusCode":200,"body":"ok"}'
+  served_by 4 0
+  served_by 4 4
+  served_by 4 8
   stub aws-cloudwatch-get-metric-statistics out "$(datapoints 0 0)" 0
-  stub aws-cloudwatch-get-metric-statistics out "$(datapoints 3 4)" 1
+  stub aws-cloudwatch-get-metric-statistics out "$(datapoints 1 2)" 1
 }
 bake_ready
-out="$(bake "$endpoint" 4 1 2>/dev/null)" || die "selftest: a healthy canary failed"
-[ "$out" = "$(printf 'CANARY_PROBES=12\nCANARY_FAILED_PROBES=0\nCANARY_ERRORS=0\nCANARY_INVOCATIONS=7')" ] || die "selftest: the bake printed: $out"
-[ "$(grep -c '^curl ' "$sd/calls")" = 12 ] || die "selftest: one minute must send 12 probes"
-calls_have "--max-time 5 ${endpoint}/health" || die "selftest: the probes must GET /health through the API with a timeout"
+out="$(bake 4 1 2>/dev/null)" || die "selftest: a healthy canary failed"
+[ "$out" = "$(printf 'CANARY_PROBES=12\nCANARY_NEW_HITS=3\nCANARY_FAILED_PROBES=0\nCANARY_ERRORS=0\nCANARY_INVOCATIONS=3')" ] || die "selftest: the bake printed: $out"
+[ "$(cat "$sd/aws-lambda-invoke.n")" = 12 ] || die "selftest: one minute must send 12 probes"
+calls_have "invoke --function-name sis-dev-app --qualifier live --cli-binary-format raw-in-base64-out" || die "selftest: the probes must invoke the alias live"
+! calls_have "--qualifier 4" || die "selftest: the probes must not invoke the version directly (the weights must apply)"
+# shellcheck disable=SC2016  # literal JSON text of the event
+for want in '"rawPath":"/health"' '"rawPath":"/version"' '"rawPath":"/"' '"routeKey":"$default"' '"accountId":"anonymous"'; do
+  calls_have "$want" || die "selftest: the probe events lack $want"
+done
+[ ! -e "$sd/curl.n" ] || die "selftest: the canary must not use curl"
 calls_have "--metric-name Errors --dimensions Name=FunctionName,Value=sis-dev-app Name=Resource,Value=sis-dev-app:live Name=ExecutedVersion,Value=4" \
   || die "selftest: the error metric must be read for the version through the alias"
 calls_have "--metric-name Invocations" || die "selftest: the invocations of the version must be read"
-ok "canary-bake: probes through the API, then the Errors metric of the version"
+ok "canary-bake: alias probes judged on ExecutedVersion and statusCode, then the Errors metric of the version"
+# C1: an app 500 is a successful invoke; its statusCode fails the canary when the new version served it.
 bake_ready
-stub curl out 502 5
-expect_fail "a canary with one failed probe" "1 of 12 probes were not 2xx" bake "$endpoint" 4 1
+served_by 4 4 '{"statusCode":500,"body":"boom"}'
+expect_fail "a canary whose new version answered 500" "1 probe(s) served by version 4 (or by an unknown version) were not 2xx" bake 4 1
 case "$EXPECT_OUT" in *"CANARY_FAILED_PROBES=1"*) ;; *) die "selftest: a failed canary must still print its counts: $EXPECT_OUT" ;; esac
+! calls_have "get-metric-statistics" || die "selftest: a failed probe must fail before the metrics"
 bake_ready
-stub curl out 000 0
-stub curl rc 28 0
-expect_fail "a canary with a timed-out probe" "1 of 12 probes were not 2xx" bake "$endpoint" 4 1
+stub aws-lambda-invoke out '{"StatusCode":200,"FunctionError":"Unhandled","ExecutedVersion":"4"}' 8
+stub aws-lambda-invoke payload "{\"errorMessage\":\"crash in ${acct}\"}" 8
+expect_fail "a canary whose new version crashed" "were not 2xx" bake 4 1
+no_acct "$EXPECT_OUT" "the canary FunctionError"
+bake_ready
+stub aws-lambda-invoke payload '"not an http response"' 0
+expect_fail "a canary whose new version answered no HTTP response" "were not 2xx" bake 4 1
+# The old version failing is not the canary's failure: warned, not judged.
+bake_ready
+served_by 3 1 '{"statusCode":503,"body":"x"}'
+out="$(bake 4 1 2>&1)" || die "selftest: a failure on the old version must not fail the canary: $out"
+case "$out" in *"served by version 3 (not the canary)"*) ;; *) die "selftest: a failure on the old version must be warned about: $out" ;; esac
+# Fail closed: a failed invoke, or an answer without ExecutedVersion, may be the new version.
+bake_ready
+stub aws-lambda-invoke rc 255 2
+stub aws-lambda-invoke err "Connection reset for ${acct}" 2
+expect_fail "a canary with a failed invoke" "were not 2xx" bake 4 1
+no_acct "$EXPECT_OUT" "the failed canary invoke"
+bake_ready
+stub aws-lambda-invoke out '{"StatusCode":200}' 2
+expect_fail "a canary answer without ExecutedVersion" "were not 2xx" bake 4 1
+# Too few hits on the new version: the bake is extended, not failed, up to a cap.
+bake_ready
+rm -f "$sd"/aws-lambda-invoke.out.4 "$sd"/aws-lambda-invoke.out.8
+served_by 4 13
+served_by 4 15
+stub aws-cloudwatch-get-metric-statistics out "$(datapoints 0 3)" 1
+out="$(bake 4 1 2>&1)" || die "selftest: a canary with too few hits must be extended: $out"
+case "$out" in *"only 1 of 12 probes reached version 4 (minimum 3): extending"*) ;; *) die "selftest: the extension must be warned about: $out" ;; esac
+case "$out" in *"CANARY_PROBES=16"*"CANARY_NEW_HITS=3"*) ;; *) die "selftest: the extension must stop at the third hit: $out" ;; esac
+bake_ready
+rm -f "$sd"/aws-lambda-invoke.out.4 "$sd"/aws-lambda-invoke.out.8
+expect_fail "a canary that never reaches its minimum" "only 1 of 24 probes reached version 4, the minimum is 3" bake 4 1
+[ "$(cat "$sd/aws-lambda-invoke.n")" = 24 ] || die "selftest: the extension must stop at the cap (the bake at most doubles)"
+bake_ready
+rm -f "$sd"/aws-lambda-invoke.out.4 "$sd"/aws-lambda-invoke.out.8
+expect_fail "a canary with CANARY_EXTEND_PROBES=0" "only 1 of 12 probes" stubbed env ENV=dev CANARY_PROBE_INTERVAL=0 CANARY_EXTEND_PROBES=0 "$ROOT/scripts/lambda/canary-bake.sh" 4 1
+# The metric window settles late: it is read again until Invocations counts the hits.
+bake_ready
+stub aws-cloudwatch-get-metric-statistics out "$(datapoints 0 1)" 1
+stub aws-cloudwatch-get-metric-statistics out "$(datapoints 0 0)" 2
+stub aws-cloudwatch-get-metric-statistics out "$(datapoints 1 2)" 3
+out="$(bake 4 1 2>&1)" || die "selftest: a late metric window must be read again: $out"
+[ "$(cat "$sd/aws-cloudwatch-get-metric-statistics.n")" = 4 ] || die "selftest: the metrics must be read twice (Errors and Invocations each)"
+case "$out" in *"metrics not settled (1 of 3 invocations"*) ;; *) die "selftest: an unsettled window must be logged: $out" ;; esac
+bake_ready
+rm -f "$sd"/aws-cloudwatch-get-metric-statistics.out.*
+stub aws-cloudwatch-get-metric-statistics out '{"Datapoints":[]}'
+out="$(stubbed env ENV=dev CANARY_PROBE_INTERVAL=0 CANARY_METRIC_POLL=0 CANARY_METRIC_ATTEMPTS=2 "$ROOT/scripts/lambda/canary-bake.sh" 4 1 2>&1)" \
+  || die "selftest: a window that never settles must be judged on what it shows: $out"
+[ "$(cat "$sd/aws-cloudwatch-get-metric-statistics.n")" = 4 ] || die "selftest: CANARY_METRIC_ATTEMPTS=2 must read the metrics twice"
+case "$out" in *"judged on what they show"*) ;; *) die "selftest: an unsettled window must be warned about: $out" ;; esac
 bake_ready
 stub aws-cloudwatch-get-metric-statistics out "$(datapoints 0 2)" 0
-expect_fail "a canary with errors" "reported 2 error(s)" bake "$endpoint" 4 1
+expect_fail "a canary with errors" "reported 2 error(s)" bake 4 1
 bake_ready
-stub aws-cloudwatch-get-metric-statistics out '{"Datapoints":[]}' 1
-out="$(bake "$endpoint" 4 1 2>&1)" || die "selftest: a canary without invocations must pass on its probes: $out"
-case "$out" in *"no invocation of version 4"*) ;; *) die "selftest: zero invocations must be reported: $out" ;; esac
+stub aws-cloudwatch-get-metric-statistics out "$(datapoints 0 1)" 1
+stub aws-cloudwatch-get-metric-statistics out "$(datapoints 1 0)" 2
+expect_fail "a canary whose errors show up late" "reported 1 error(s)" bake 4 1
 bake_ready
 stub aws-cloudwatch-get-metric-statistics rc 254 0
 stub aws-cloudwatch-get-metric-statistics err "An error occurred (AccessDenied) for ${acct}" 0
-expect_fail "a canary whose metrics cannot be read" "get-metric-statistics (Errors) failed (exit code 254): An error occurred (AccessDenied) for <redacted>" bake "$endpoint" 4 1
-for bad in "http://abc.execute-api.ap-southeast-1.amazonaws.com 4 1" "https://example.com 4 1" "${endpoint}/ 4 1" "$endpoint 0 1" "$endpoint 4 0" "$endpoint 4 31" "$endpoint 4"; do
+expect_fail "a canary whose metrics cannot be read" "get-metric-statistics (Errors) failed (exit code 254): An error occurred (AccessDenied) for <redacted>" bake 4 1
+for bad in "4" "0 1" "4 0" "4 31" "live 1" "${endpoint} 4 1" "4 1 x"; do
   bake_ready
   # shellcheck disable=SC2086  # the arguments are split on purpose
   expect_fail "canary-bake with '${bad}'" "" bake $bad
-  ! calls_have "curl " || die "selftest: canary-bake '${bad}' must not probe"
+  ! calls_have "lambda invoke" || die "selftest: canary-bake '${bad}' must not probe"
 done
-ok "canary-bake fails on a failed probe, a timeout, errors and bad arguments"
+ok "canary-bake fails on a non-2xx or crash of the new version, too few hits, errors and bad arguments"
+
+# === release-inputs.sh (C4: the strategy of a push comes from the environment variables)
+release_inputs() { env -u STRATEGY -u RELEASE_STRATEGY -u CANARY_PERCENT -u VARS_CANARY_PERCENT -u BAKE_MINUTES -u VARS_BAKE_MINUTES -u MODE -u SHA GITHUB_SHA="$commit" "$@" "$ROOT/scripts/lambda/release-inputs.sh"; }
+want_release() { printf 'RELEASE_MODE=%s\nSTRATEGY=%s\nCANARY_PERCENT=%s\nBAKE_MINUTES=%s\nTARGET_SHA=%s' "$1" "$2" "$3" "$4" "$5"; }
+[ "$(release_inputs 2>/dev/null)" = "$(want_release deploy all-at-once 10 5 "$commit")" ] || die "selftest: a push with no variables must be all at once with the defaults"
+[ "$(release_inputs RELEASE_STRATEGY= VARS_CANARY_PERCENT= 2>/dev/null)" = "$(want_release deploy all-at-once 10 5 "$commit")" ] || die "selftest: empty variables must mean the defaults"
+out="$(release_inputs RELEASE_STRATEGY=canary VARS_CANARY_PERCENT=25 VARS_BAKE_MINUTES=2 2>"$tmp/release.err")" || die "selftest: a push with canary variables failed"
+[ "$out" = "$(want_release deploy canary 25 2 "$commit")" ] || die "selftest: a push must take the strategy from the variables: $out"
+grep -q "strategy from the environment variable RELEASE_STRATEGY" "$tmp/release.err" || die "selftest: the log must name the variable as the origin"
+[ "$(release_inputs RELEASE_STRATEGY=canary STRATEGY=all-at-once 2>/dev/null)" = "$(want_release deploy all-at-once 10 5 "$commit")" ] || die "selftest: the dispatch input must win over the variable"
+[ "$(release_inputs RELEASE_STRATEGY=all-at-once STRATEGY=canary CANARY_PERCENT=5 VARS_CANARY_PERCENT=25 BAKE_MINUTES=1 2>/dev/null)" = "$(want_release deploy canary 5 1 "$commit")" ] \
+  || die "selftest: the dispatch inputs must win over the variables, value by value"
+[ "$(release_inputs STRATEGY=canary VARS_CANARY_PERCENT=20 2>/dev/null)" = "$(want_release deploy canary 20 5 "$commit")" ] || die "selftest: an empty input must fall back to the variable"
+[ "$(release_inputs MODE=promote SHA="$other_sha" RELEASE_STRATEGY=canary 2>/dev/null)" = "$(want_release promote canary 10 5 "$other_sha")" ] || die "selftest: a promote must read the variables too"
+[ "$(release_inputs MODE=rollback SHA="$other_sha" 2>/dev/null)" = "$(want_release rollback all-at-once 10 5 "$other_sha")" ] || die "selftest: a rollback must release the given commit"
+ok "release-inputs: dispatch input, else environment variable, else default"
+expect_fail "release-inputs with a bad RELEASE_STRATEGY" "strategy must be all-at-once or canary, got 'blue-green' (from the environment variable RELEASE_STRATEGY)" release_inputs RELEASE_STRATEGY=blue-green
+expect_fail "release-inputs with a bad CANARY_PERCENT variable" "got '75' (from the environment variable CANARY_PERCENT)" release_inputs VARS_CANARY_PERCENT=75
+expect_fail "release-inputs with a bad BAKE_MINUTES variable" "got '0' (from the environment variable BAKE_MINUTES)" release_inputs VARS_BAKE_MINUTES=0
+expect_fail "release-inputs with a newline in the variable" "strategy must be" release_inputs RELEASE_STRATEGY="$(printf 'canary\nSTRATEGY=x')"
+expect_fail "release-inputs with a bad input" "(from the input strategy)" release_inputs STRATEGY=Canary RELEASE_STRATEGY=canary
+expect_fail "release-inputs: a deploy with a sha" "sha is for mode rollback only" release_inputs SHA="$other_sha"
+expect_fail "release-inputs: a rollback without a sha" "mode rollback needs sha" release_inputs MODE=rollback
+expect_fail "release-inputs with an argument" "usage:" env GITHUB_SHA="$commit" "$ROOT/scripts/lambda/release-inputs.sh" x
+ok "release-inputs refuses bad inputs and bad variables, naming where they came from"
 
 # === api-endpoint.sh
 api_endpoint() { stubbed env ENV="${API_ENV:-dev}" "$ROOT/scripts/lambda/api-endpoint.sh"; }
 apis() { printf '{"Items":[%s]}' "$1"; }
 api_item() { printf '{"Name":"%s","ApiEndpoint":"%s","ProtocolType":"HTTP"}' "$1" "$2"; }
 stub_reset
-stub aws-apigatewayv2-get-apis out "$(apis "$(api_item sis-prod-api https://zzz.execute-api.ap-southeast-1.amazonaws.com),$(api_item sis-dev-api "$endpoint")")"
+stub aws-apigatewayv2-get-apis out "$(apis "$(api_item sis-prod-api https://zzzzz12345.execute-api.ap-southeast-1.amazonaws.com),$(api_item sis-dev-api "$endpoint")")"
 [ "$(api_endpoint 2>/dev/null)" = "API_ENDPOINT=${endpoint}" ] || die "selftest: api-endpoint did not pick sis-dev-api"
-[ "$(API_ENV=prod api_endpoint 2>/dev/null)" = "API_ENDPOINT=https://zzz.execute-api.ap-southeast-1.amazonaws.com" ] || die "selftest: api-endpoint did not derive the prod name"
+[ "$(API_ENV=prod api_endpoint 2>/dev/null)" = "API_ENDPOINT=https://zzzzz12345.execute-api.ap-southeast-1.amazonaws.com" ] || die "selftest: api-endpoint did not derive the prod name"
 stub_reset
 stub aws-apigatewayv2-get-apis out "$(apis "$(api_item sis-prod-api "$endpoint")")"
 expect_fail "api-endpoint without the API" "found 0" api_endpoint
@@ -390,6 +595,12 @@ stub_reset
 stub aws-apigatewayv2-get-apis out "$(apis "$(api_item sis-dev-api "https://${acct}.example.com")")"
 expect_fail "api-endpoint with an unexpected endpoint" "unexpected form" api_endpoint
 no_acct "$EXPECT_OUT" "the unexpected endpoint"
+# The API ID is exactly 10 characters (API_ENDPOINT_RE in lib.sh).
+for bad_id in abc abc123defgh; do
+  stub_reset
+  stub aws-apigatewayv2-get-apis out "$(apis "$(api_item sis-dev-api "https://${bad_id}.execute-api.ap-southeast-1.amazonaws.com")")"
+  expect_fail "api-endpoint with the API ID '${bad_id}'" "unexpected form" api_endpoint
+done
 ok "api-endpoint finds exactly one API by name"
 
 # === verify-live.sh
@@ -410,7 +621,16 @@ expect_fail "verify-live of another commit" "after 6 attempts (last: git_sha ${o
 stub_reset
 stub curl rc 7
 expect_fail "verify-live without an answer" "last: no answer" verify_live "$endpoint" "$commit" "$d"
-expect_fail "verify-live with a bad endpoint" "the API endpoint must be" verify_live "http://x" "$commit" "$d"
+# M1: the endpoint arrives as a job output in a job without credentials; only the exact API form is accepted, before any
+# request.
+for bad in "http://x" "http://abc123defg.execute-api.ap-southeast-1.amazonaws.com" "https://abc123def.execute-api.ap-southeast-1.amazonaws.com" \
+  "https://abc123defgh.execute-api.ap-southeast-1.amazonaws.com" "${endpoint}/" "${endpoint}/version" "${endpoint}.evil.example" \
+  "https://evil.example/abc123defg.execute-api.ap-southeast-1.amazonaws.com" "https://ABC123DEFG.execute-api.ap-southeast-1.amazonaws.com" \
+  "$(printf '%s\nhttps://evil.example' "$endpoint")" ""; do
+  stub_reset
+  expect_fail "verify-live with the endpoint '${bad//$'\n'/ NEWLINE }'" "the API endpoint must be" verify_live "$bad" "$commit" "$d"
+  ! calls_have "curl " || die "selftest: verify-live must not request a refused endpoint"
+done
 ok "verify-live retries and compares commit and digest"
 
 # === prune-versions.sh

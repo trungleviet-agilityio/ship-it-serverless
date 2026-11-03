@@ -1,14 +1,18 @@
 # App promote to prod (ADR 0012 L7, L8; ADR 0008 P9, P10, S2; ADR 0010; FR-13, FR-16).
 # A manual run on main takes a commit SHA that app-deploy already released in dev, copies that exact image (same digest,
 # no rebuild) from the dev ECR to the prod ECR, and releases it on the prod function like app-deploy does: publish a
-# version (code by digest, IMAGE_DIGEST), smoke-invoke it, move the alias `live` all at once or through a canary, read
-# /version through the API, prune old versions. Rollback is the same run with an earlier green SHA: the prod tag already
+# version (code by digest, IMAGE_DIGEST and the description), smoke-invoke it, move the alias `live` all at once or
+# through a canary (probes invoke the alias through the Lambda API), prune old versions; then a job without credentials
+# reads /version through the API. The strategy comes from the dispatch input (prod environment variables
+# RELEASE_STRATEGY, CANARY_PERCENT and BAKE_MINUTES only fill an empty input, scripts/lambda/release-inputs.sh). Rollback is the same run with an earlier green SHA: the prod tag already
 # holds that digest, so nothing is copied (scripts/image/promote-copy.sh), and the version of that SHA is reused when it
 # still exists (scripts/lambda/publish.sh).
 # The file path is part of the prod deploy role trust (ADR 0008 P7): bootstrap `workflow_files` lists app-promote.yml
 # when promotion_source_account_id is set.
-# Two jobs: `resolve` proves the SHA was green in dev with git and the GitHub API only (no token, no environment, no
-# secret); `promote` is the only job that can assume the prod deploy role, after the prod environment is approved.
+# Three jobs: `resolve` proves the SHA was green in dev (green `deploy (dev)` and `verify (dev)` jobs) with git and the
+# GitHub API only (no token, no environment, no secret); `promote` is the only job that can assume the prod deploy role,
+# after the prod environment is approved; `verify` reads /version through the HTTP API with no token, no environment
+# and no secret, so no credentialed job needs an execute-api host (ADR 0012 L7, review M1).
 # Jobs that assume an AWS role run harden-runner in block mode with telemetry off and an exact allowlist (ADR 0007 S39).
 # Hosts holding an account ID come from secret expressions, never literals. The dev registry host is the one named
 # exception of the harden-runner policy (ADR 0008 P8).
@@ -92,9 +96,16 @@ jobs:
     permissions:
       contents: read
       id-token: write # OIDC token for the role assumed by configure-aws-credentials
+    # The verify job reads these. None holds an account ID; each was validated by the script that produced it, and
+    # verify-live.sh validates them again.
+    outputs:
+      released: ${{ steps.release.outputs.released }}
+      sha: ${{ steps.release.outputs.sha }}
+      digest: ${{ steps.release.outputs.digest }}
+      api-endpoint: ${{ steps.release.outputs.api-endpoint }}
     steps:
-      # The execute-api host holds the API ID, which exists only after terraform-iac apply: it is the one wildcard
-      # family the policy allows, for the canary probes and the live check (ADR 0012 L7).
+      # No execute-api host: the canary probes invoke the alias through the Lambda API, and /version through the HTTP API
+      # is read by the verify job, which holds no credentials (ADR 0012 L7, review M1).
       - name: Harden runner
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
@@ -114,7 +125,6 @@ jobs:
             apigateway.${{ vars.AWS_REGION }}.amazonaws.com:443
             monitoring.${{ vars.AWS_REGION }}.amazonaws.com:443
             secretsmanager.${{ vars.AWS_REGION }}.amazonaws.com:443
-            *.execute-api.${{ vars.AWS_REGION }}.amazonaws.com:443
 
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -129,6 +139,9 @@ jobs:
           STRATEGY: ${{ inputs.strategy }}
           CANARY_PERCENT: ${{ inputs.canary_percent }}
           BAKE_MINUTES: ${{ inputs.bake_minutes }}
+          RELEASE_STRATEGY: ${{ vars.RELEASE_STRATEGY }}
+          VARS_CANARY_PERCENT: ${{ vars.CANARY_PERCENT }}
+          VARS_BAKE_MINUTES: ${{ vars.BAKE_MINUTES }}
         run: scripts/lambda/release-inputs.sh >> "$GITHUB_ENV"
 
       - name: Derive the resource names
@@ -217,23 +230,28 @@ jobs:
         if: steps.preflight.outputs.function == 'present'
         run: scripts/lambda/api-endpoint.sh >> "$GITHUB_OUTPUT"
 
+      # A version that is already the primary is a no-op (shift-alias.sh prints a notice).
       - name: Move live to the version (all at once)
         if: steps.preflight.outputs.function == 'present' && env.STRATEGY == 'all-at-once'
         env:
           VERSION: ${{ steps.publish.outputs.VERSION }}
         run: scripts/lambda/shift-alias.sh "$VERSION"
 
-      # Weight, bake, then 100 percent. A failed bake fails the step; the next step removes the weight.
+      # Weight, bake (probes invoke the alias `live`), then 100 percent. A failed bake fails the step; the next step
+      # removes the weight. A version that is already the primary gets no weight and no bake.
       - name: Canary, bake, then move live
         id: canary
         if: steps.preflight.outputs.function == 'present' && env.STRATEGY == 'canary'
         env:
           VERSION: ${{ steps.publish.outputs.VERSION }}
-          API_ENDPOINT: ${{ steps.api.outputs.API_ENDPOINT }}
         run: |
           set -euo pipefail
-          scripts/lambda/shift-alias.sh "$VERSION" --weight "$CANARY_PERCENT"
-          scripts/lambda/canary-bake.sh "$API_ENDPOINT" "$VERSION" "$BAKE_MINUTES" >> "$GITHUB_OUTPUT"
+          shifted="$(scripts/lambda/shift-alias.sh "$VERSION" --weight "$CANARY_PERCENT")"
+          if grep -qx 'ALIAS_CHANGED=false' <<<"$shifted"; then
+            echo "canary=skipped" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          scripts/lambda/canary-bake.sh "$VERSION" "$BAKE_MINUTES" >> "$GITHUB_OUTPUT"
           scripts/lambda/shift-alias.sh "$VERSION"
 
       # Runs when the canary step failed or the run was cancelled during the bake: the old version keeps 100 percent.
@@ -243,11 +261,20 @@ jobs:
           echo "::error::canary of the new version failed: removing its weight; the previous version keeps all traffic"
           scripts/lambda/shift-alias.sh --clear-weights
 
-      - name: Verify live through the API
+      # Hands the release to the verify job. Runs only when every release step above succeeded.
+      - name: Hand the release to verify
+        id: release
         if: steps.preflight.outputs.function == 'present'
         env:
           API_ENDPOINT: ${{ steps.api.outputs.API_ENDPOINT }}
-        run: scripts/lambda/verify-live.sh "$API_ENDPOINT" "$TARGET_SHA" "$IMAGE_DIGEST"
+        run: |
+          set -euo pipefail
+          {
+            echo "released=true"
+            echo "sha=${TARGET_SHA}"
+            echo "digest=${IMAGE_DIGEST}"
+            echo "api-endpoint=${API_ENDPOINT}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Prune old versions
         id: prune
@@ -263,6 +290,8 @@ jobs:
           FUNCTION_STATE: ${{ steps.preflight.outputs.function }}
           VERSION: ${{ steps.publish.outputs.VERSION }}
           REUSED: ${{ steps.publish.outputs.REUSED }}
+          CANARY_SKIPPED: ${{ steps.canary.outputs.canary }}
+          CANARY_HITS: ${{ steps.canary.outputs.CANARY_NEW_HITS }}
           CANARY_FAILED_PROBES: ${{ steps.canary.outputs.CANARY_FAILED_PROBES }}
           CANARY_ERRORS: ${{ steps.canary.outputs.CANARY_ERRORS }}
           PRUNED: ${{ steps.prune.outputs.PRUNED }}
@@ -283,7 +312,8 @@ jobs:
           fi
           canary="not run"
           if [[ "${STRATEGY:-}" == "canary" ]]; then
-            canary="${CANARY_PERCENT:-?}% for ${BAKE_MINUTES:-?} min, failed probes ${CANARY_FAILED_PROBES:-not known}, errors ${CANARY_ERRORS:-not known}"
+            canary="${CANARY_PERCENT:-?}% for ${BAKE_MINUTES:-?} min, probes on the new version ${CANARY_HITS:-not known}, failed probes ${CANARY_FAILED_PROBES:-not known}, errors ${CANARY_ERRORS:-not known}"
+            if [[ "${CANARY_SKIPPED:-}" == "skipped" ]]; then canary="skipped (the version was already live)"; fi
           fi
           role="$(scripts/names.sh role 2>/dev/null)" || role="not assumed"
           {
@@ -293,6 +323,36 @@ jobs:
             echo "Version: ${version}"
             echo "Strategy: ${STRATEGY:-not validated}; canary: ${canary}"
             echo "Versions pruned: ${PRUNED:-not run}"
-            echo "Result: ${JOB_STATUS}"
+            echo "Result: ${JOB_STATUS} (the verify job reads /version through the API next)"
             echo "Role: \`${role}\`"
           } | scripts/aws/assert-no-account-id.sh >> "$GITHUB_STEP_SUMMARY"
+
+  # The front-door check (ADR 0012 L6, L7; review M1): GET /version through the HTTP API must show the released commit
+  # and digest. No OIDC token, no deployment environment, no secrets, so this is the only job that may talk to an
+  # execute-api host, and harden-runner stays in audit like every job without credentials.
+  verify:
+    name: verify (prod)
+    needs: promote
+    if: needs.promote.outputs.released == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
+
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # verify-live.sh matches the endpoint against the API endpoint pattern before any request.
+      - name: Verify live through the API
+        env:
+          API_ENDPOINT: ${{ needs.promote.outputs.api-endpoint }}
+          RELEASED_SHA: ${{ needs.promote.outputs.sha }}
+          RELEASED_DIGEST: ${{ needs.promote.outputs.digest }}
+        run: scripts/lambda/verify-live.sh "$API_ENDPOINT" "$RELEASED_SHA" "$RELEASED_DIGEST"

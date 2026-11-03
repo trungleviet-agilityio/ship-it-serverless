@@ -24,7 +24,7 @@ endpoints="$(printf '%s' "$RUN_OUT" | jq -r --arg name "$API" '[(.Items // [])[]
   || die "get-apis returned no API list"
 count="$(printf '%s' "$endpoints" | grep -c . || true)"
 [ "$count" -eq 1 ] || die "expected exactly one HTTP API named ${API}, found ${count} (run terraform-iac apply for ${ENV})"
-[[ "$endpoints" =~ ^https://[a-z0-9]+\.execute-api\.[a-z0-9-]+\.amazonaws\.com$ ]] \
+valid_api_endpoint "$endpoints" \
   || die "the endpoint of ${API} has an unexpected form: '$(printf '%s' "$endpoints" | redact_ids)'"
 ok "${API}: ${endpoints}"
 printf 'API_ENDPOINT=%s\n' "$endpoints"

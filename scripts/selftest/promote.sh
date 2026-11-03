@@ -31,11 +31,12 @@ git_in checkout -q main
 resolve() { (cd "$repo" && stubbed "$ROOT/scripts/image/promote-resolve.sh" "$@"); }
 # run_list <sha> <conclusion> <branch> <event>: one run in the answer of `gh run list`.
 run_list() { printf '[{"databaseId": 77, "headSha": "%s", "conclusion": "%s", "headBranch": "%s", "event": "%s"}]' "$1" "$2" "$3" "$4"; }
-# run_jobs <build conclusion> <deploy conclusion> [release step conclusion]: the answer of `gh run view --json jobs`. The
-# release step (Verify live through the API) concludes like the deploy job unless given.
+# run_jobs <build conclusion> <deploy conclusion> [push step conclusion] [verify conclusion]: the answer of `gh run view
+# --json jobs`. The push step (Push the image to ECR, skipped in a rollback run) and the job verify (dev) conclude like
+# the deploy job unless given.
 run_jobs() {
-  printf '{"jobs": [{"name": "build, scan", "conclusion": "%s", "steps": []}, {"name": "deploy (dev)", "conclusion": "%s", "steps": [{"name": "Publish the version", "conclusion": "%s"}, {"name": "Verify live through the API", "conclusion": "%s"}]}]}' \
-    "$1" "$2" "${3:-$2}" "${3:-$2}"
+  printf '{"jobs": [{"name": "build, scan", "conclusion": "%s", "steps": []}, {"name": "deploy (dev)", "conclusion": "%s", "steps": [{"name": "Push the image to ECR", "conclusion": "%s"}, {"name": "Publish the version", "conclusion": "%s"}]}, {"name": "verify (dev)", "conclusion": "%s", "steps": [{"name": "Verify live through the API", "conclusion": "%s"}]}]}' \
+    "$1" "$2" "${3:-$2}" "$2" "${4:-$2}" "${4:-$2}"
 }
 # green_run <sha>: a push run on main whose deploy job succeeded.
 green_run() {
@@ -100,17 +101,37 @@ stub gh-run-view out "$(run_jobs success failure)"
 expect_fail "resolve with the deploy job failed" "never deployed to dev" resolve "$sha_a"
 stub_reset
 stub gh-run-list out "$(run_list "$sha_a" success main push)"
-stub gh-run-view out '{"jobs": [{"name": "deploy (prod)", "conclusion": "success", "steps": [{"name": "Verify live through the API", "conclusion": "success"}]}]}'
-expect_fail "resolve with only a job of another name" "never deployed to dev" resolve "$sha_a"
-# The first run of an environment ends green with the function not created yet: nothing was released, so the image
-# was never smoke-tested on Lambda (ADR 0012 L3).
+stub gh-run-view out '{"jobs": [{"name": "deploy (prod)", "conclusion": "success", "steps": [{"name": "Push the image to ECR", "conclusion": "success"}]}, {"name": "verify (prod)", "conclusion": "success"}]}'
+expect_fail "resolve with only jobs of another name" "never deployed to dev" resolve "$sha_a"
+# The first run of an environment ends green with the function not created yet: the verify job is skipped, nothing was
+# released, so the image never ran on Lambda (ADR 0012 L3).
 stub_reset
 stub gh-run-list out "$(run_list "$sha_a" success main push)"
-stub gh-run-view out "$(run_jobs success success skipped)"
-expect_fail "resolve with a green deploy that released nothing" "never deployed to dev" resolve "$sha_a"
+stub gh-run-view out "$(run_jobs success success success skipped)"
+expect_fail "resolve with a green deploy whose verify job was skipped" "never deployed to dev" resolve "$sha_a"
+# M1: the front-door check is its own job; a failed or missing verify (dev) is not green.
 stub_reset
 stub gh-run-list out "$(run_list "$sha_a" success main push)"
-stub gh-run-view out '{"jobs": [{"name": "deploy (dev)", "conclusion": "success"}]}'
+stub gh-run-view out "$(run_jobs success success success failure)"
+expect_fail "resolve with a failed verify job" "never deployed to dev" resolve "$sha_a"
+stub_reset
+stub gh-run-list out "$(run_list "$sha_a" success main push)"
+stub gh-run-view out "$(run_jobs success success | jq -c '.jobs |= map(select(.name != "verify (dev)"))')"
+expect_fail "resolve without a verify job" "never deployed to dev" resolve "$sha_a"
+# A rollback run (mode rollback) has main HEAD as its head commit but released an older one: its push step is skipped,
+# so it never makes its head commit green.
+stub_reset
+stub gh-run-list out "$(run_list "$sha_a" success main workflow_dispatch)"
+stub gh-run-view out "$(run_jobs skipped success skipped success)"
+expect_fail "resolve with a rollback run of the commit" "never deployed to dev" resolve "$sha_a"
+# The verify job alone, without a deploy job of this run, is not green either.
+stub_reset
+stub gh-run-list out "$(run_list "$sha_a" success main push)"
+stub gh-run-view out "$(run_jobs success skipped skipped success)"
+expect_fail "resolve with a verify job but a skipped deploy job" "never deployed to dev" resolve "$sha_a"
+stub_reset
+stub gh-run-list out "$(run_list "$sha_a" success main push)"
+stub gh-run-view out '{"jobs": [{"name": "deploy (dev)", "conclusion": "success"}, {"name": "verify (dev)", "conclusion": "success"}]}'
 expect_fail "resolve with a deploy job without steps" "never deployed to dev" resolve "$sha_a"
 stub_reset
 stub gh-run-list out "$(run_list "$sha_a" success main push)"
@@ -136,7 +157,7 @@ resolve "$sha_b" >/dev/null 2>&1 || die "selftest: the tip of origin/main with a
 git_in update-ref -d refs/remotes/origin/main
 expect_fail "resolve without origin/main" "could not compare" resolve "$sha_a"
 git_in update-ref refs/remotes/origin/main "$sha_b"
-ok "promote-resolve: only a green ancestor of origin/main with a deployed dev job passes"
+ok "promote-resolve: only a green ancestor of origin/main with green deploy (dev) and verify (dev) jobs passes"
 
 # === promote-copy.sh: the stub crane and aws, and a temp dir the test inspects afterwards.
 other_acct="$(printf '%s%s' 111111 222222)"
