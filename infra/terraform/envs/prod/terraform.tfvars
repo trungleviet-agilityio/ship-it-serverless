@@ -4,18 +4,17 @@
 aws_region = "ap-southeast-1"
 prefix     = "sls"
 env        = "prod"
-azs        = ["ap-southeast-1a", "ap-southeast-1b"]
-vpc_cidr   = "10.50.0.0/16"
 
-# ADR 0008 P9: prod is the end of the path; nothing promotes from it.
-promotion_target_env = ""
-
-# Placeholder that never serves (ADR 0005, F2): the Docker official image on ECR Public, pinned by index digest.
-# It has no command, so it exits at once and the first deployment after a create stalls by design. app-deploy sets
-# the real image by digest (it replaces only the image field of the latest task definition revision).
-container_image = "public.ecr.aws/docker/library/python:3.13-slim@sha256:d98cc29d3266e535dd9da1099688d9cb3ca4753813571e071763d17725460962"
-
-desired_count      = 1
-task_cpu           = 256
-task_memory        = 512
+# Function shape (ADR 0012 L1). The image is not set here: the function is created from the newest image in the
+# bootstrap repository (promoted from dev by digest), and App Promote owns the image after that (L3, L8).
+memory_mb          = 512
+timeout_s          = 10
 log_retention_days = 7
+
+# Cost ceiling (ADR 0012 L2, L10): stage throttling works in any account.
+api_throttle_rate_limit  = 5
+api_throttle_burst_limit = 10
+
+# Optional second cap. Lambda refuses a reservation that leaves the account fewer than 100 unreserved, so keep it
+# unset while the account concurrency quota is low (some new accounts have 10, ADR 0012 Finding 10).
+# reserved_concurrency = 5

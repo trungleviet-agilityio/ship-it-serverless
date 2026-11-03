@@ -1,35 +1,14 @@
 resource "aws_iam_role" "apply" {
   name                 = local.role_names.apply
-  description          = "GitHub Actions apply for envs/dev, scoped to the services of modules/app-ecs"
+  description          = "GitHub Actions apply for envs/<env>, scoped to the services of modules/app-lambda"
   path                 = "/"
   max_session_duration = 3600
   assume_role_policy   = data.aws_iam_policy_document.trust["apply"].json
 }
 
-locals {
-  ec2_arn = "${local.svc_arn["ec2"]}:*"
-
-  # Resource-type ARNs, so no statement guarded by RequestTag spans the whole region.
-  ec2_type_arn = { for t in ["vpc", "subnet", "internet-gateway", "route-table", "security-group", "security-group-rule"] : t => "${local.svc_arn["ec2"]}:${t}/*" }
-
-  ec2_create_actions = [
-    "CreateVpc",
-    "CreateSubnet",
-    "CreateInternetGateway",
-    "CreateRouteTable",
-    "CreateSecurityGroup",
-    "AuthorizeSecurityGroupIngress",
-    "AuthorizeSecurityGroupEgress",
-  ]
-
-  elb_arns = [
-    "${local.svc_arn["elasticloadbalancing"]}:loadbalancer/app/${local.name}-*/*",
-    "${local.svc_arn["elasticloadbalancing"]}:targetgroup/${local.name}-*/*",
-    "${local.svc_arn["elasticloadbalancing"]}:listener/app/${local.name}-*/*/*",
-    "${local.svc_arn["elasticloadbalancing"]}:listener-rule/app/${local.name}-*/*/*/*",
-  ]
-}
-
+# ADR 0012 L9 (FR-4 rewritten): state as before, then exactly what modules/app-lambda creates. The ECR repository
+# lives in bootstrap (L4), so the apply role only reads it. EC2, ELB, ECS and ECR-write statements are gone with ECS
+# (L11).
 data "aws_iam_policy_document" "apply" {
   # State access (B18).
   statement {
@@ -59,325 +38,69 @@ data "aws_iam_policy_document" "apply" {
     resources = [local.lock_arn]
   }
 
-  # EC2 has random IDs, so scope by tag (B14).
+  # Function, alias, permission, concurrency and tags (L3), as the aws provider calls them for aws_lambda_function,
+  # aws_lambda_alias and aws_lambda_permission. Scoped to this env's functions and their qualified ARNs.
+  # UpdateFunctionCode stays: architectures is set through it, even though Terraform ignores image_uri.
   statement {
-    sid       = "Ec2Read"
-    effect    = "Allow"
-    actions   = ["ec2:Describe*"]
-    resources = ["*"] # No resource-level support for Describe
+    sid    = "LambdaFunction"
+    effect = "Allow"
+    actions = [
+      "lambda:CreateFunction",
+      "lambda:DeleteFunction",
+      "lambda:GetFunction",
+      "lambda:GetFunctionConfiguration",
+      "lambda:GetFunctionCodeSigningConfig",
+      "lambda:GetRuntimeManagementConfig",
+      "lambda:UpdateFunctionCode",
+      "lambda:UpdateFunctionConfiguration",
+      "lambda:PublishVersion",
+      "lambda:ListVersionsByFunction",
+      "lambda:CreateAlias",
+      "lambda:DeleteAlias",
+      "lambda:GetAlias",
+      "lambda:UpdateAlias",
+      "lambda:AddPermission",
+      "lambda:RemovePermission",
+      "lambda:GetPolicy",
+      "lambda:PutFunctionConcurrency",
+      "lambda:DeleteFunctionConcurrency",
+      "lambda:GetFunctionConcurrency",
+      "lambda:TagResource",
+      "lambda:UntagResource",
+      "lambda:ListTags",
+    ]
+    resources = local.function_arns_env
   }
 
-  # Creates carry the tags on the new resource (RequestTag). A parent that already exists must carry them too
-  # (ResourceTag), so a child cannot be attached to a VPC that this lab does not own.
+  # data "aws_ecr_image" (most_recent) picks the first image of the one repository (L3). Read only: the repository
+  # and its policy belong to bootstrap (L4).
   statement {
-    sid     = "Ec2CreateTopLevelTagged"
-    effect  = "Allow"
-    actions = ["ec2:CreateVpc", "ec2:CreateInternetGateway"]
+    sid       = "EcrReadOneRepo"
+    effect    = "Allow"
+    actions   = ["ecr:DescribeImages", "ecr:DescribeRepositories"]
+    resources = [local.ecr_repo_app]
+  }
+
+  # HTTP API, integration, route and stage (L2). API Gateway authorizes by HTTP verb on the resource path. API IDs
+  # are random, so the paths are every HTTP API of this region; tags are written through POST/DELETE on /tags/*.
+  statement {
+    sid    = "ApiGatewayHttpApi"
+    effect = "Allow"
+    actions = [
+      "apigateway:GET",
+      "apigateway:POST",
+      "apigateway:PUT",
+      "apigateway:PATCH",
+      "apigateway:DELETE",
+    ]
     resources = [
-      local.ec2_type_arn["vpc"],
-      local.ec2_type_arn["internet-gateway"],
+      "${local.apigateway_arn}/apis",
+      "${local.apigateway_arn}/apis/*",
+      "${local.apigateway_arn}/tags/*",
     ]
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:RequestTag/Project"
-      values   = [local.tag_project]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:RequestTag/Env"
-      values   = [var.env]
-    }
   }
 
-  statement {
-    sid     = "Ec2CreateChildTagged"
-    effect  = "Allow"
-    actions = ["ec2:CreateSubnet", "ec2:CreateRouteTable", "ec2:CreateSecurityGroup"]
-    resources = [
-      local.ec2_type_arn["subnet"],
-      local.ec2_type_arn["route-table"],
-      local.ec2_type_arn["security-group"],
-    ]
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:RequestTag/Project"
-      values   = [local.tag_project]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:RequestTag/Env"
-      values   = [var.env]
-    }
-  }
-
-  statement {
-    sid       = "Ec2CreateChildInTaggedVpc"
-    effect    = "Allow"
-    actions   = ["ec2:CreateSubnet", "ec2:CreateRouteTable", "ec2:CreateSecurityGroup"]
-    resources = [local.ec2_type_arn["vpc"]]
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:ResourceTag/Project"
-      values   = [local.tag_project]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:ResourceTag/Env"
-      values   = [var.env]
-    }
-  }
-
-  # Authorize* touches the security group (tags exist) and the new rule (no tags yet, only RequestTag is
-  # available there). The rule statement carries no condition: it is useless without the gated group statement.
-  statement {
-    sid       = "Ec2AuthorizeRulesOnTaggedGroup"
-    effect    = "Allow"
-    actions   = ["ec2:AuthorizeSecurityGroupIngress", "ec2:AuthorizeSecurityGroupEgress"]
-    resources = [local.ec2_type_arn["security-group"]]
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:ResourceTag/Project"
-      values   = [local.tag_project]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:ResourceTag/Env"
-      values   = [var.env]
-    }
-  }
-
-  statement {
-    sid       = "Ec2AuthorizeRuleResource"
-    effect    = "Allow"
-    actions   = ["ec2:AuthorizeSecurityGroupIngress", "ec2:AuthorizeSecurityGroupEgress"]
-    resources = [local.ec2_type_arn["security-group-rule"]]
-  }
-
-  statement {
-    sid     = "Ec2TagOnCreate"
-    effect  = "Allow"
-    actions = ["ec2:CreateTags"]
-    resources = [for t in ["vpc", "subnet", "internet-gateway", "route-table", "security-group", "security-group-rule"] :
-    local.ec2_type_arn[t]]
-
-    condition {
-      test     = "StringEquals"
-      variable = "ec2:CreateAction"
-      values   = local.ec2_create_actions
-    }
-  }
-
-  statement {
-    sid    = "Ec2ManageTagged"
-    effect = "Allow"
-    actions = [
-      "ec2:DeleteVpc",
-      "ec2:ModifyVpcAttribute",
-      "ec2:DeleteSubnet",
-      "ec2:ModifySubnetAttribute",
-      "ec2:AttachInternetGateway",
-      "ec2:DetachInternetGateway",
-      "ec2:DeleteInternetGateway",
-      "ec2:DeleteRouteTable",
-      "ec2:CreateRoute",
-      "ec2:ReplaceRoute",
-      "ec2:DeleteRoute",
-      "ec2:AssociateRouteTable",
-      "ec2:DisassociateRouteTable",
-      "ec2:DeleteSecurityGroup",
-      "ec2:RevokeSecurityGroupIngress",
-      "ec2:RevokeSecurityGroupEgress",
-      "ec2:ModifySecurityGroupRules",
-      "ec2:UpdateSecurityGroupRuleDescriptionsIngress",
-      "ec2:UpdateSecurityGroupRuleDescriptionsEgress",
-      "ec2:CreateTags",
-      "ec2:DeleteTags",
-    ]
-    resources = [local.ec2_arn]
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:ResourceTag/Project"
-      values   = [local.tag_project]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:ResourceTag/Env"
-      values   = [var.env]
-    }
-  }
-
-  # The provider calls this when it creates an ALB with security groups. Tag-scoped, no wildcard action.
-  statement {
-    sid       = "Ec2ValidateSgQuotasOnTaggedGroup"
-    effect    = "Allow"
-    actions   = ["ec2:ValidateSecurityGroupQuotasForInterface"]
-    resources = ["${local.svc_arn["ec2"]}:security-group/*"]
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:ResourceTag/Project"
-      values   = [local.tag_project]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:ResourceTag/Env"
-      values   = [var.env]
-    }
-  }
-
-  # ELB calls this with the caller's identity when it creates a load balancer. Its only resource type is vpc.
-  statement {
-    sid       = "Ec2SgsForTaggedVpc"
-    effect    = "Allow"
-    actions   = ["ec2:GetSecurityGroupsForVpc"]
-    resources = [local.ec2_type_arn["vpc"]]
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:ResourceTag/Project"
-      values   = [local.tag_project]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:ResourceTag/Env"
-      values   = [var.env]
-    }
-  }
-
-  statement {
-    sid       = "ElbRead"
-    effect    = "Allow"
-    actions   = ["elasticloadbalancing:Describe*"]
-    resources = ["*"] # No resource-level support for Describe
-  }
-
-  statement {
-    sid    = "ElbManage"
-    effect = "Allow"
-    actions = [
-      "elasticloadbalancing:CreateLoadBalancer",
-      "elasticloadbalancing:DeleteLoadBalancer",
-      "elasticloadbalancing:ModifyLoadBalancerAttributes",
-      "elasticloadbalancing:SetSecurityGroups",
-      "elasticloadbalancing:SetSubnets",
-      "elasticloadbalancing:CreateTargetGroup",
-      "elasticloadbalancing:DeleteTargetGroup",
-      "elasticloadbalancing:ModifyTargetGroup",
-      "elasticloadbalancing:ModifyTargetGroupAttributes",
-      "elasticloadbalancing:CreateListener",
-      "elasticloadbalancing:DeleteListener",
-      "elasticloadbalancing:ModifyListener",
-      "elasticloadbalancing:ModifyListenerAttributes",
-      "elasticloadbalancing:CreateRule",
-      "elasticloadbalancing:DeleteRule",
-      "elasticloadbalancing:ModifyRule",
-      "elasticloadbalancing:AddTags",
-      "elasticloadbalancing:RemoveTags",
-    ]
-    resources = local.elb_arns
-  }
-
-  statement {
-    sid    = "EcsCluster"
-    effect = "Allow"
-    actions = [
-      "ecs:CreateCluster",
-      "ecs:DeleteCluster",
-      "ecs:DescribeClusters",
-      "ecs:UpdateCluster",
-      "ecs:UpdateClusterSettings",
-      "ecs:PutClusterCapacityProviders",
-      "ecs:TagResource",
-      "ecs:UntagResource",
-      "ecs:ListTagsForResource",
-    ]
-    resources = ["${local.svc_arn["ecs"]}:cluster/${local.name}-*"]
-  }
-
-  statement {
-    sid    = "EcsService"
-    effect = "Allow"
-    actions = [
-      "ecs:CreateService",
-      "ecs:UpdateService",
-      "ecs:DeleteService",
-      "ecs:DescribeServices",
-      "ecs:TagResource",
-      "ecs:UntagResource",
-      "ecs:ListTagsForResource",
-    ]
-    resources = ["${local.svc_arn["ecs"]}:service/${local.resource_names.ecs_cluster}/*"]
-  }
-
-  # Cost guard: task size is capped on registration (B18).
-  statement {
-    sid       = "EcsTaskDefRegister"
-    effect    = "Allow"
-    actions   = ["ecs:RegisterTaskDefinition"]
-    resources = ["${local.svc_arn["ecs"]}:task-definition/${local.name}-*:*"]
-
-    condition {
-      test     = "NumericLessThanEquals"
-      variable = "ecs:task-cpu"
-      values   = ["512"]
-    }
-
-    condition {
-      test     = "NumericLessThanEquals"
-      variable = "ecs:task-memory"
-      values   = ["1024"]
-    }
-  }
-
-  statement {
-    sid       = "EcsTaskDefTags"
-    effect    = "Allow"
-    actions   = ["ecs:TagResource", "ecs:ListTagsForResource"]
-    resources = ["${local.svc_arn["ecs"]}:task-definition/${local.name}-*:*"]
-  }
-
-  statement {
-    sid       = "EcsTaskDefUnscoped"
-    effect    = "Allow"
-    actions   = ["ecs:DescribeTaskDefinition", "ecs:DeregisterTaskDefinition"]
-    resources = ["*"] # No resource-level support
-  }
-
-  statement {
-    sid    = "Ecr"
-    effect = "Allow"
-    actions = [
-      "ecr:CreateRepository",
-      "ecr:DeleteRepository",
-      "ecr:DescribeRepositories",
-      "ecr:DescribeImages",
-      "ecr:PutImageScanningConfiguration",
-      "ecr:PutImageTagMutability",
-      "ecr:PutLifecyclePolicy",
-      "ecr:GetLifecyclePolicy",
-      "ecr:DeleteLifecyclePolicy",
-      "ecr:GetRepositoryPolicy",
-      "ecr:SetRepositoryPolicy",
-      "ecr:DeleteRepositoryPolicy",
-      "ecr:TagResource",
-      "ecr:UntagResource",
-      "ecr:ListTagsForResource",
-    ]
-    resources = [local.ecr_repo_pattern]
-  }
-
+  # The two log groups (L10): the function's and the HTTP API access log.
   statement {
     sid    = "Logs"
     effect = "Allow"
@@ -395,11 +118,39 @@ data "aws_iam_policy_document" "apply" {
     resources = local.log_group_arns
   }
 
+  # API Gateway HTTP API access logging permissions: the caller that sets access_log_settings on a stage needs the
+  # CloudWatch Logs vended-delivery actions. CreateLogDelivery, GetLogDelivery, UpdateLogDelivery,
+  # DeleteLogDelivery, ListLogDeliveries, PutResourcePolicy, DescribeResourcePolicies and DescribeLogGroups support
+  # no resource-level permissions (Service Authorization Reference), so they take "*".
   statement {
-    sid       = "LogsRead"
-    effect    = "Allow"
-    actions   = ["logs:DescribeLogGroups"]
-    resources = ["*"] # No resource-level support
+    sid    = "LogsDeliveryUnscoped"
+    effect = "Allow"
+    actions = [
+      "logs:CreateLogDelivery",
+      "logs:GetLogDelivery",
+      "logs:UpdateLogDelivery",
+      "logs:DeleteLogDelivery",
+      "logs:ListLogDeliveries",
+      "logs:PutResourcePolicy",
+      "logs:DescribeResourcePolicies",
+      "logs:DescribeLogGroups",
+    ]
+    resources = ["*"] # No resource-level support (see above)
+  }
+
+  # The three alarms (L10), all named <prefix>-<env>-*.
+  statement {
+    sid    = "CloudWatchAlarms"
+    effect = "Allow"
+    actions = [
+      "cloudwatch:PutMetricAlarm",
+      "cloudwatch:DeleteAlarms",
+      "cloudwatch:DescribeAlarms",
+      "cloudwatch:TagResource",
+      "cloudwatch:UntagResource",
+      "cloudwatch:ListTagsForResource",
+    ]
+    resources = ["${local.svc_arn["cloudwatch"]}:alarm:${local.name}-*"]
   }
 
   # Secret shells only: G1 denies reading or writing values.
@@ -418,9 +169,10 @@ data "aws_iam_policy_document" "apply" {
     resources = [local.secret_pattern]
   }
 
-  # Roles can only be created or changed with the boundary attached (B15).
+  # The execution role can only be created or changed with the boundary attached (B15, L9). Exact ARN, not a
+  # <name>-app-* pattern: the module creates one role, and a wildcard role pattern fails the M1 test.
   statement {
-    sid    = "IamEcsRolesBounded"
+    sid    = "IamAppRoleBounded"
     effect = "Allow"
     actions = [
       "iam:CreateRole",
@@ -430,7 +182,7 @@ data "aws_iam_policy_document" "apply" {
       "iam:UpdateAssumeRolePolicy",
       "iam:DeleteRole",
     ]
-    resources = local.ecs_role_arns
+    resources = [local.app_exec_role_arn]
 
     condition {
       test     = "StringEquals"
@@ -440,7 +192,7 @@ data "aws_iam_policy_document" "apply" {
   }
 
   statement {
-    sid    = "IamEcsRolesRead"
+    sid    = "IamAppRoleRead"
     effect = "Allow"
     actions = [
       "iam:GetRole",
@@ -454,32 +206,35 @@ data "aws_iam_policy_document" "apply" {
       "iam:UpdateRole",
       "iam:UpdateRoleDescription",
     ]
-    resources = local.ecs_role_arns
+    resources = [local.app_exec_role_arn]
   }
 
+  # CreateFunction and UpdateFunctionConfiguration with a Role need PassRole (Finding 9): the one execution role,
+  # to Lambda only.
   statement {
-    sid       = "PassEcsRoles"
+    sid       = "PassAppExecRole"
     effect    = "Allow"
     actions   = ["iam:PassRole"]
-    resources = local.ecs_role_arns
+    resources = [local.app_exec_role_arn]
 
     condition {
       test     = "StringEquals"
       variable = "iam:PassedToService"
-      values   = ["ecs-tasks.amazonaws.com"]
+      values   = ["lambda.amazonaws.com"]
     }
   }
 
+  # API Gateway creates its service-linked role on first use in an account.
   statement {
     sid       = "ServiceLinkedRoles"
     effect    = "Allow"
     actions   = ["iam:CreateServiceLinkedRole"]
-    resources = ["${local.iam_arn}:role/aws-service-role/ecs.amazonaws.com/*", "${local.iam_arn}:role/aws-service-role/elasticloadbalancing.amazonaws.com/*"]
+    resources = ["${local.iam_arn}:role/aws-service-role/ops.apigateway.amazonaws.com/*"]
 
     condition {
       test     = "StringEquals"
       variable = "iam:AWSServiceName"
-      values   = ["ecs.amazonaws.com", "elasticloadbalancing.amazonaws.com"]
+      values   = ["ops.apigateway.amazonaws.com"]
     }
   }
 

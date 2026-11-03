@@ -1,35 +1,26 @@
 # Nothing here carries the account ID: apply logs are public (ADR 0004, E18). ARNs and the ECR URL stay module outputs.
-output "alb_url" {
-  description = "Public URL of the load balancer (plain HTTP)."
-  value       = "http://${module.app_ecs.alb_dns_name}"
+output "function_name" {
+  description = "Lambda function name."
+  value       = module.app_lambda.function_name
 }
 
-output "cluster_name" {
-  description = "ECS cluster name."
-  value       = module.app_ecs.cluster_name
+output "alias_name" {
+  description = "Alias the HTTP API invokes; App Deploy moves it."
+  value       = module.app_lambda.alias_name
 }
 
-output "service_name" {
-  description = "ECS service name."
-  value       = module.app_ecs.service_name
+output "api_endpoint" {
+  description = "Public HTTPS endpoint of the HTTP API (no account ID in it)."
+  value       = module.app_lambda.api_endpoint
 }
 
-output "task_family" {
-  description = "Task definition family."
-  value       = module.app_ecs.task_family
-}
-
+# The repository name, not its URL: the URL holds the account ID (tf/policy.sh rule 8).
 output "ecr_repository_name" {
-  description = "ECR repository name."
-  value       = module.app_ecs.ecr_repository_name
-}
-
-output "log_group_name" {
-  description = "Application log group."
-  value       = module.app_ecs.log_group_name
+  description = "ECR repository App Deploy pushes to (owned by bootstrap, ADR 0012 L4)."
+  value       = module.app_lambda.ecr_repository_name
 }
 
 output "secret_name" {
   description = "Secrets Manager secret name. Set its value by hand (put-secret-value)."
-  value       = module.app_ecs.secret_name
+  value       = module.app_lambda.secret_name
 }

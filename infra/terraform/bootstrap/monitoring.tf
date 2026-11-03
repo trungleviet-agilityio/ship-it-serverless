@@ -194,6 +194,33 @@ data "aws_iam_policy_document" "security_alerts" {
       values   = [aws_cloudwatch_event_rule.oidc_unexpected.arn]
     }
   }
+
+  # ADR 0012 L10: the app alarms of envs/<env> (Lambda Errors and Throttles, HTTP API 5xx) notify this topic.
+  # CloudWatch publishes as its service principal; the conditions limit it to this env's alarms in this account
+  # (confused deputy protection). The CI roles still cannot touch the topic (G6).
+  statement {
+    sid       = "CloudWatchAlarmPublish"
+    effect    = "Allow"
+    actions   = ["sns:Publish"]
+    resources = [aws_sns_topic.security_alerts.arn]
+
+    principals {
+      type        = "Service"
+      identifiers = ["cloudwatch.amazonaws.com"]
+    }
+
+    condition {
+      test     = "ArnLike"
+      variable = "aws:SourceArn"
+      values   = ["${local.svc_arn["cloudwatch"]}:alarm:${local.name}-*"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [local.account_id]
+    }
+  }
 }
 
 resource "aws_sns_topic_policy" "security_alerts" {

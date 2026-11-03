@@ -28,39 +28,19 @@ variable "env" {
   }
 }
 
-variable "azs" {
-  type        = list(string)
-  description = "Two availability zones for the public subnets."
-}
-
-variable "vpc_cidr" {
-  type        = string
-  description = "CIDR block of the VPC."
-}
-
-variable "container_image" {
-  type        = string
-  description = "Container image pinned by digest. A public placeholder that never serves: app-deploy sets the real image by digest."
-}
-
-variable "desired_count" {
+variable "memory_mb" {
   type        = number
-  description = "Number of Fargate tasks."
+  description = "Function memory in MB."
 }
 
-variable "task_cpu" {
+variable "timeout_s" {
   type        = number
-  description = "Task-level CPU units."
-}
-
-variable "task_memory" {
-  type        = number
-  description = "Task-level memory in MiB."
+  description = "Function timeout in seconds (at most 30, the HTTP API limit)."
 }
 
 variable "log_retention_days" {
   type        = number
-  description = "Retention of the application log group."
+  description = "Retention of the function and API access log groups."
 }
 
 variable "secret_recovery_window_days" {
@@ -69,32 +49,18 @@ variable "secret_recovery_window_days" {
   default     = 0
 }
 
-variable "alb_ingress_cidrs_json" {
-  type        = string
-  description = "JSON list of IPv4 CIDRs allowed to reach the ALB on port 80, e.g. [\"198.51.100.7/32\"]. CI passes the secret ALB_INGRESS_CIDRS. Empty means 0.0.0.0/0 (ADR 0007 S10)."
-  default     = ""
-  sensitive   = true
-
-  validation {
-    condition = var.alb_ingress_cidrs_json == "" || (
-      can(jsondecode(var.alb_ingress_cidrs_json))
-      && can(tolist(jsondecode(var.alb_ingress_cidrs_json)))
-      && length(jsondecode(var.alb_ingress_cidrs_json)) >= 1
-      && alltrue([for c in jsondecode(var.alb_ingress_cidrs_json) : can(regex("^[0-9]{1,3}(\\.[0-9]{1,3}){3}/[0-9]{1,2}$", c)) && can(cidrhost(c, 0))])
-    )
-    error_message = "alb_ingress_cidrs_json must be empty or a JSON list of at least one IPv4 CIDR."
-  }
+variable "reserved_concurrency" {
+  type        = number
+  description = "Reserved concurrency of the function; null means no reservation (ADR 0012 L10, Finding 10)."
+  default     = null
 }
 
-variable "promotion_target_env" {
-  type        = string
-  description = "Environment that promotes this environment's images (ADR 0008 P9): \"prod\" in dev, empty elsewhere. Set in terraform.tfvars."
-  default     = ""
+variable "api_throttle_rate_limit" {
+  type        = number
+  description = "Steady-state requests per second of the HTTP API stage (the cost ceiling, ADR 0012 L2)."
 }
 
-variable "promotion_target_account_id" {
-  type        = string
-  description = "Account of promotion_target_env. Never committed: CI passes TF_VAR_promotion_target_account_id from the secret PROMOTION_TARGET_ACCOUNT_ID (env dev) or AWS_ACCOUNT_ID_PROD (PR plan)."
-  default     = ""
-  sensitive   = true
+variable "api_throttle_burst_limit" {
+  type        = number
+  description = "Burst limit of the HTTP API stage."
 }
