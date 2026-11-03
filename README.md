@@ -80,24 +80,30 @@ There is no `apply` or `destroy` target (ADR 0001 D15).
 | Workflow | Trigger | Does |
 |---|---|---|
 | **App CI** `app-ci.yml` | PR touching `app/**` | No AWS: hadolint, build (tests run inside), smoke, Trivy |
-| **App Deploy** `app-deploy.yml` | push to `main` touching `app/**`; dispatch | `build-scan` (no AWS) then `deploy (dev)` with approval: preflight, push by SHA tag, update code by **digest**, set `IMAGE_DIGEST`, publish a version, **smoke-invoke that version**, move `live` (all at once, or canary), check `/version` through the API, prune old versions. Dispatch inputs: `mode` (`deploy` or `rollback`), `strategy` (`all-at-once` or `canary`), `canary_percent`, `bake_minutes`, `sha` (rollback) |
-| **App Promote** `app-promote.yml` | dispatch on `main` with a green `sha` | `resolve` (no AWS; the SHA must be on `main` with a dev deploy whose step "Verify live through the API" passed, so an image that never ran on Lambda cannot be promoted), then `promote` in `prod` with approval: crane copy by digest from dev ECR, then the same release steps. Rollback = promote an earlier green SHA; when prod already has a version with that digest, only the alias moves |
+| **App Deploy** `app-deploy.yml` | push to `main` touching `app/**`; dispatch | `build-scan` (no AWS) then `deploy (dev)` with approval (no Docker, sudo or containers): preflight, crane push by SHA tag, update code by **digest**, set `IMAGE_DIGEST` and the description, publish a version, **smoke-invoke that version**, move `live` (all at once, or canary), prune old versions; then `verify (dev)` (no credentials) checks `/version` through the API. Dispatch inputs: `mode` (`deploy` or `rollback`), `strategy`, `canary_percent`, `bake_minutes`, `sha` (rollback, gated by a green-SHA check). Push deploys take the strategy from the environment variable `RELEASE_STRATEGY` |
+| **App Promote** `app-promote.yml` | dispatch on `main` with a green `sha` | `resolve` (no AWS; the SHA must be on `main` with green `deploy (dev)` and `verify (dev)` jobs, so an image that never ran on Lambda cannot be promoted), then `promote` in `prod` with approval: crane copy by digest from dev ECR, then the same release steps. Rollback = promote an earlier green SHA; when prod already has a version with that digest, only the alias moves |
 | **Terraform** `terraform-iac.yml` | PR touching `infra/**`; push to `main`; dispatch | Plan with the read-only role and a PR comment; apply with approval |
 | **Terraform Destroy** `terraform-destroy.yml` | dispatch, typed confirmation | Delete-only plan, then apply that plan |
 | **Repo Guard**, **OIDC Smoke Test** | every PR / trust changes | Workflow policy, secrets scan, parity guard, negative trust tests |
 
 ### How a release works
 
-1. `UpdateFunctionCode --image-uri <repo>@sha256:<digest>`, then `IMAGE_DIGEST` is set so `/version` can prove
-   the digest.
-2. `PublishVersion` with the description `sha=<sha> digest=<digest>`. A version is immutable: it pins that digest.
+1. `UpdateFunctionCode --image-uri <repo>@sha256:<digest>`, then one configuration update sets `IMAGE_DIGEST` (so
+   `/version` can prove the digest) and the description `sha=<sha> digest=<digest>`. Writing the description first
+   matters: `PublishVersion` creates no version when nothing changed, and Terraform already published version 1 with
+   the same digest.
+2. `PublishVersion` with that description. A version is immutable: it pins that digest. A version whose image and
+   `IMAGE_DIGEST` already match is reused.
 3. The pipeline invokes **the new version directly** (not the alias) with an API Gateway event for `/health` and
-   `/version`. A broken build stops here and never receives traffic: the Web Adapter only reports ready when
-   `/health` answers 200.
+   `/version`, retrying a cold-start failure a few times. A broken build stops here and never receives traffic: the
+   Web Adapter only reports ready when `/health` answers 200.
 4. `all-at-once`: `live` points at the new version. `canary`: `live` keeps the old version and sends
-   `canary_percent` to the new one for `bake_minutes`; synthetic probes and the new version's `Errors` metric decide
-   to promote it to 100 percent or remove the weight.
-5. `/version` through the API must show the SHA and digest.
+   `canary_percent` to the new one for `bake_minutes`. Probes invoke the alias directly (`/health`, `/version`, `/`),
+   so the weights apply and each response names the version that served it; any non-2xx from the new version fails
+   the canary. The new version's `Errors` metric is a second, crash-only signal (an app 500 is a successful invoke).
+   Pass: 100 percent; fail: the weight is removed.
+5. A separate job without AWS credentials reads `/version` through the API, which must show the SHA and digest. The
+   credentialed jobs never allow an `*.execute-api` host in their egress list.
 
 ## Repo configuration the pipelines read
 
@@ -231,27 +237,44 @@ Cold start numbers for [`docs/tradeoffs.md`](docs/tradeoffs.md) section 14: open
 
 ### 5. Canary
 
-Merge an app change, approve the push deploy as usual, then: Actions > **App Deploy** > Run workflow
-(`strategy` = `canary`, `canary_percent` = `10`, `bake_minutes` = `5`) on the next change.
+A push deploy releases the merged commit, so a canary must be chosen before the merge. Set the strategy for the
+`dev` environment (these variables are read only when the dispatch input is empty):
+
+```bash
+gh variable set RELEASE_STRATEGY --env dev --body canary
+```
+
+Optional: `gh variable set CANARY_PERCENT --env dev --body 10` and `gh variable set BAKE_MINUTES --env dev --body 5`
+(defaults 10 and 5). Then merge an app change through a PR and approve `deploy (dev)`. A dispatch on a commit that is
+already live is a no-op (the summary says so).
 
 ```bash
 AWS_PROFILE=sls-dev-admin aws lambda get-alias --region ap-southeast-1 --function-name sls-dev-app --name live --query RoutingConfig
 ```
 
 Expect during the bake: `{"AdditionalVersionWeights": {"<new>": 0.1}}`; after a green run: `null`, and
-`FunctionVersion` is the new version.
+`FunctionVersion` is the new version. The run log shows each probe with its executed version and HTTP status.
+Switch back to all-at-once afterwards:
+
+```bash
+gh variable delete RELEASE_STRATEGY --env dev
+```
 
 ### 6. Broken build never gets traffic
 
-On a branch, make `/health` return 500 (for example set `BREAK=true` as the default in `board.py`), merge it
-through a PR, approve the deploy.
+Two gates stop a broken build. A build whose `/health` fails everywhere (for example `BREAK=true` as the default)
+already fails in `build-scan` (`scripts/image/smoke.sh`), before any AWS step. To see the **Lambda** gate, break
+something only Lambda sees: on a branch, make `/health` in `app/src/board.py` return 500 when
+`AWS_LAMBDA_FUNCTION_NAME` is set, merge it through a PR and approve the deploy.
 
-Expect: the run fails at the smoke invoke; `get-alias` still shows the previous version; the API still serves the
-previous `/version`. Revert the change with a PR.
+Expect: `build-scan` passes (no Lambda variable there); `deploy (dev)` fails at "Smoke-invoke the version" (the Web
+Adapter never reports ready, so the version's invoke fails); `get-alias` still shows the previous version and the API
+still serves the previous `/version`. Revert the change with a PR.
 
 ### 7. Rollback in dev
 
 Actions > **App Deploy** > Run workflow (`mode` = `rollback`, `sha` = an earlier SHA that was deployed to dev).
+A credential-free gate first checks that this SHA had a green `deploy (dev)` and `verify (dev)` run on `main`.
 
 Expect: the summary says the version was reused (no new version published), and `/version` shows the earlier SHA
 and digest within seconds.

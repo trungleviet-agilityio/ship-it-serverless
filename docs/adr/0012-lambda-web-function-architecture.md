@@ -29,7 +29,7 @@ Inherited rules that constrain the design:
 | ADR 0011 | Every AWS name is `<prefix>-<env>-<thing>`; `project.env` holds the prefix |
 | App contract (ADR 0011) | One port, a health path, `/version` with the commit SHA and the image digest, no writes to disk, secrets from the environment |
 | ADR 0002, 0004 E1/E2, 0007 S2 | Trust pins `aud`, immutable `sub`, `repository_id`, `repository_owner_id`, `ref`, `aws:RequestedRegion`, `job_workflow_ref` (`app-deploy.yml` in dev, `app-promote.yml` in prod) |
-| FR-3 to FR-5 | Plan read-only; apply limited to the module's services with exact `iam:PassRole`; deploy limited to one repository and one runtime target; no CI role reads a secret value |
+| FR-3 to FR-5 | Plan read-only; apply limited to the module's services with exact `iam:PassRole`; deploy limited to one repository and one runtime target; no CI role reads a secret value through its own policy (the deploy role can still run code as the execution role: accepted risk R7) |
 | FR-8 | Terraform creates only the secret shell; the value never reaches state or git |
 | ADR 0005 F2 | Terraform owns the runtime shape; the deploy swaps only the image, by digest |
 | ADR 0007 | Actions by SHA, tools by version and checksum, harden-runner `block` on credentialed jobs, base images by digest |
@@ -179,17 +179,33 @@ the version's `IMAGE_DIGEST`, and `/version` through the API.
 | CodeDeploy traffic shifting | Managed canary, alarm-based auto revert, hooks | CodeDeploy app, deployment group, service role, `PassRole` to CodeDeploy, hook functions; meaningless canary at near-zero traffic |
 | All at once only | Simplest | Nothing to learn about canaries |
 
-**Choice: pipeline-driven.** Every deploy: preflight, push once, `UpdateFunctionCode` by digest, set
-`IMAGE_DIGEST`, `PublishVersion` (description `sha=<40 hex> digest=sha256:<64 hex>`), smoke-invoke **that version**
-with an HTTP API v2 event for `/health` and `/version`, then either:
+**Choice: pipeline-driven.** Every deploy: preflight, push once (crane, from the sha256-checked tarball, no Docker in
+the credentialed job), `UpdateFunctionCode` by digest, then **one** `UpdateFunctionConfiguration` that sets
+`IMAGE_DIGEST` and the function description `sha=<40 hex> digest=sha256:<64 hex>`, `PublishVersion` with the same
+description, smoke-invoke **that version** (bounded retries for a cold start `FunctionError`) with an HTTP API v2
+event for `/health` and `/version`, then either:
 
 - `all-at-once` (default): `UpdateAlias live` to the new version;
-- `canary` (dispatch input): `UpdateAlias live` with `routing_config` weight `canary_percent` (default 10) on the new
-  version, a bake of `bake_minutes` (default 5) that sends synthetic `/health` requests through the API and then
-  reads the `Errors` metric with dimension `ExecutedVersion` for the new version. Zero errors and zero failed
-  probes: promote to 100 percent. Otherwise: remove the weight (old version keeps 100 percent) and fail the run.
+- `canary`: `UpdateAlias live` with `routing_config` weight `canary_percent` (default 10) on the new version, then a
+  bake of `bake_minutes` (default 5) that **invokes the alias directly** (`lambda invoke --qualifier live`, so the
+  weights apply and the response names the executed version) with `/health`, `/version` and `/` in rotation. The
+  judgment is the HTTP status in each payload served by the new version (any non-2xx or `FunctionError` fails; too
+  few hits on the new version extends the bake up to a cap), then the `Errors` metric with `ExecutedVersion`, read
+  after the metric window settles, as a crash-only second signal (with the Web Adapter an app 500 is a successful
+  invoke). Pass: promote to 100 percent. Otherwise: remove the weight and fail the run.
 
-The run ends by reading `/version` through the API.
+The strategy comes from the dispatch input, else from the environment variable `RELEASE_STRATEGY` (with
+`CANARY_PERCENT` and `BAKE_MINUTES`), so a push deploy can be a canary too. A release to the version that is already
+primary is a no-op.
+
+**Why the description is written before publishing** (review B1): `PublishVersion` creates no version when code and
+configuration are unchanged since the last one. Terraform publishes version 1 at create with the same digest, so the
+first deploy would get version 1 back. Writing the description makes `$LATEST` differ; a version is also accepted
+when its resolved image and `IMAGE_DIGEST` match, whatever its description.
+
+**Front-door check in a job without credentials** (review M1): after the release job, a job `verify (<env>)` with no
+OIDC token and no secrets reads `/version` through the API. The credentialed jobs no longer allow any
+`*.execute-api` host in harden-runner, so deploy credentials can never reach an API in another account.
 
 ### L8. Promote and rollback
 
@@ -199,7 +215,8 @@ Promote keeps ADR 0008 P9 and P10: `app-promote.yml` dispatch with a green SHA, 
 **Rollback** is one path in both workflows: if the function already has a published version whose description
 names the requested digest, the run skips push and publish, smoke-invokes that version and moves `live` (seconds).
 Prod rolls back by promoting an earlier green SHA (FR-16); dev also gets `app-deploy.yml` dispatch `mode: rollback`
-with a `sha` input that must have a version in dev. `git revert` stays the normal dev path. Deploy prunes published
+with a `sha` input, gated by the same credential-free check as promote: the SHA must have a green `deploy (dev)` and
+`verify (dev)` run on `main`. `git revert` stays the normal dev path. Deploy prunes published
 versions beyond the newest 10 that `live` does not reference; ECR keeps 20 images, so no kept version points at a
 deleted image (Finding 7).
 
@@ -214,6 +231,7 @@ deleted image (Finding 7).
   `ListVersionsByFunction`, `GetAlias`, `UpdateAlias`, `InvokeFunction`.
 - `lambda:DeleteFunction` on `function:<prefix>-<env>-app:*` only (qualified ARNs, so it can prune versions but never
   delete the function).
+- `ecr:GetRepositoryPolicy` on its repository (Lambda checks it on `UpdateFunctionCode`).
 - `apigateway:GET` on `/apis` and `/apis/*` of this region, to find the API endpoint by name.
 - `cloudwatch:GetMetricStatistics` (`*`, no resource-level support) for the canary judgment.
 - `secretsmanager:DescribeSecret` on the one secret (metadata only, ADR 0006 G14).
@@ -223,14 +241,26 @@ deleted image (Finding 7).
 **Apply role** (FR-4 rewritten): state as today; Lambda function, alias, permission, concurrency and tags on
 `function:<prefix>-<env>-*`; API Gateway on `/apis` and `/apis/*` and `/tags/*` of this region; logs on
 `/aws/lambda/<prefix>-<env>-*` and `/aws/apigateway/<prefix>-<env>-*` plus the log-delivery actions HTTP API access
-logging needs; CloudWatch alarms `<prefix>-<env>-*`; ECR read (`DescribeImages`, `DescribeRepositories`) on the one
-repository for the data source; the secret shell; IAM role CRUD on exactly `<prefix>-<env>-app-exec` (no wildcard
+logging needs (on `*`: accepted risk, re-checked at the live checkpoint); CloudWatch alarms `<prefix>-<env>-*`; ECR
+read (`DescribeImages`, `DescribeRepositories`, plus `BatchGetImage`, `GetDownloadUrlForLayer` and
+`GetRepositoryPolicy`, which the Lambda docs require from whoever creates an image function) on the one repository,
+never `SetRepositoryPolicy` (bootstrap owns the policy and it already allows Lambda); `lambda:AddPermission` only for
+`lambda:Principal = apigateway.amazonaws.com`; the secret shell; IAM role CRUD on exactly `<prefix>-<env>-app-exec` (no wildcard
 role pattern, test M1) with the bootstrap boundary required; `iam:PassRole` **only** on `<prefix>-<env>-app-exec` with `iam:PassedToService =
 lambda.amazonaws.com`. EC2, ELB, ECS and ECR-write statements are deleted. Plan role unchanged.
 
 **Execution role** `<prefix>-<env>-app-exec` (Terraform, under the renamed boundary `<prefix>-<env>-app-boundary`):
 `logs:CreateLogStream` and `logs:PutLogEvents` on the function's log group; `secretsmanager:GetSecretValue` on the one
-secret. Not `AWSLambdaBasicExecutionRole` (it allows `logs:CreateLogGroup` on `*`).
+secret, only with `ArnEquals lambda:SourceFunctionArn = <unqualified function ARN>` (in the role policy and in the
+boundary). Not `AWSLambdaBasicExecutionRole` (it allows `logs:CreateLogGroup` on `*`). Trust: `lambda.amazonaws.com`
+with no `aws:SourceAccount` condition (not documented for Lambda execution roles; a missing key would fail closed and
+stop the function).
+
+**Who can reach the secret value** (review M3): no CI role policy allows `GetSecretValue` (guardrail G1 denies it).
+The apply role could re-create the execution role with a foreign trust, but the boundary and role policy only allow
+the read from inside the function (`lambda:SourceFunctionArn`). The deploy role can ship new code that runs as the
+execution role and reads the secret: an accepted risk (R7), gated by the main-only trust, the environment approval and
+the pinned workflow file. The apply role can also write a value with `CreateSecret`/`UpdateSecret` (ADR 0002 R1).
 
 ### L10. Cost ceiling and observability
 
@@ -307,6 +337,9 @@ CIDR rules are deleted.
 | R4 | Deploy role can change env values, memory and timeout | No `PassRole`; the publish script changes only `IMAGE_DIGEST`; the next PR plan shows drift |
 | R5 | (S) and (C) facts may differ on live pages | Checkpoint steps; allow `docs.aws.amazon.com` in the environment and re-check |
 | R6 | Hand-written SigV4 | AWS published example as a unit test; a live read is part of the first checkpoint |
+| R7 | The deploy role runs code as the execution role, so a compromised deploy can read the secret | Main-only trust, `job_workflow_ref` pin, environment approval, no `PassRole`; `APP_API_KEY` from env is ignored on Lambda (review M2) |
+| R8 | After a teardown and re-create, the function starts on the newest image in ECR (could be an aborted canary) | README re-create steps run a release of a known-green SHA right after the apply (review L4) |
+| R9 | HTTP API access-log delivery actions are allowed on `*` for the apply role | Resource types not checkable offline; re-check the Service Authorization Reference at the live checkpoint (review L7) |
 
 ## Questions left for the owner
 
@@ -330,6 +363,11 @@ CIDR rules are deleted.
 - Parameters and Secrets extension: https://docs.aws.amazon.com/systems-manager/latest/userguide/ps-integration-lambda-extensions.html
 - Pricing: https://aws.amazon.com/lambda/pricing/, https://aws.amazon.com/api-gateway/pricing/, https://aws.amazon.com/elasticloadbalancing/pricing/
 - CodeDeploy for Lambda (secondary): https://oneuptime.com/blog/post/2026-02-12-codedeploy-lambda-deployments/view
+- Source function ARN condition key: https://docs.aws.amazon.com/lambda/latest/dg/permissions-source-function-arn.html
+- Weighted alias canary and `ExecutedVersion`: https://docs.aws.amazon.com/lambda/latest/dg/configuring-alias-routing.html
+- Versions (no new version without a change): https://docs.aws.amazon.com/lambda/latest/dg/configuration-versions.html, https://docs.aws.amazon.com/lambda/latest/api/API_PublishVersion.html
+- Image function creator permissions: https://docs.aws.amazon.com/lambda/latest/dg/images-create.html (EU mirror: https://docs.aws.eu/lambda/latest/dg/images-create.html)
+- `AddPermission` condition keys: https://docs.aws.amazon.com/lambda/latest/api/API_AddPermission.html
 - SigV4 signing process: https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_sigv-create-signed-request.html
 - Secrets Manager `GetSecretValue`: https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_GetSecretValue.html
 - Repo: ADR 0001 to 0011; `infra/terraform/bootstrap/*.tf`; `app/`; `scripts/image/build.sh`, `scripts/image/ecr-push.sh`
@@ -340,3 +378,4 @@ CIDR rules are deleted.
 |---|---|
 | 2026-11-03 | Proposed (design only) |
 | 2026-11-03 | Scope change from the owner (relayed by a peer session): the agent decides, builds the lab offline and documents every trade-off. Front door changed from Function URL to HTTP API (L2), canary added (L7), ECS removed (L11), prefix `sls` (L12). Status accepted by the agent |
+| 2026-11-03 | Review fixes (B1 to C5): description before publish, ECR pull rights for the apply role, alias-direct canary probes judged on HTTP status, front-door check without credentials, no `*.execute-api` in credentialed jobs, crane push without Docker, green check for dev rollback, `lambda:SourceFunctionArn` on the secret read, exact ECR `aws:sourceArn`, `lambda:Principal` on `AddPermission`, risks R7 to R9 |
