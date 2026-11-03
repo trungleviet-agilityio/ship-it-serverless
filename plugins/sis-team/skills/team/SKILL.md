@@ -1,6 +1,6 @@
 ---
 name: team
-description: Show the sis-team agent roster for the ship-it-safely lab as a table (agent, phase, model, access, which skill spawns it, what it does), read from the plugin's agent and skill files. Read-only. Use as /sis-team:team.
+description: Show the sis-team agent roster for the ship-it-serverless lab as a table (agent, phase, model, access, which skill spawns it, what it does), read from the plugin's agent and skill files. Read-only. Use as /sis-team:team.
 ---
 
 # /sis-team:team

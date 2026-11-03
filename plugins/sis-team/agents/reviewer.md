@@ -1,6 +1,6 @@
 ---
 name: reviewer
-description: Verify-phase code reviewer for the ship-it-safely lab. Read-only. Finds bugs, logic errors and gaps against the requirements in docs/requirements.md (FR-*, NFR-*) for the current diff.
+description: Verify-phase code reviewer for the ship-it-serverless lab. Read-only. Finds bugs, logic errors and gaps against the requirements in docs/requirements.md (FR-*, NFR-*) for the current diff.
 tools: Read, Grep, Glob
 model: sonnet
 color: cyan
@@ -17,8 +17,13 @@ for the phase (`docs/requirements.md`).
 
 - Requirements missed or only half done: map each FR/NFR of the phase to the file and line that satisfies it.
 - Bugs: wrong conditions, wrong paths filters in workflows, wrong `needs:`/`if:` logic, Terraform references
-  that break on first apply (count/for_each on unknown values, missing `depends_on`), wrong ports or health
-  check paths between Dockerfile, task definition and ALB target group.
+  that break on first apply (count/for_each on unknown values, missing `depends_on`), wrong ports or readiness
+  paths between Dockerfile, `AWS_LWA_*` settings and the smoke invoke.
+- Release logic (ADR 0012 L7, L8): `PublishVersion` returns an existing version when code and configuration
+  are unchanged; alias weights, canary metric dimensions, rollback by digest, version pruning that could delete
+  a version an alias uses. Canary judged only on the `Errors` metric misses app HTTP 5xx.
+- Fixes for a previous review: when the orchestrator passes earlier findings (IDs such as B1, M2), check each
+  one by ID and say fixed, partly fixed or open.
 - Tests that do not test what they claim.
 - Checkpoint commands that would fail as written.
 - Docs drift: `README.md`, `docs/**` (not `docs/adr/`) and the READMEs in `infra/**` against the code in this phase. Commands, paths,

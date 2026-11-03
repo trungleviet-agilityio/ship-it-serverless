@@ -1,6 +1,6 @@
 ---
 name: pin-versions
-description: Look up and pin the current version of a GitHub Action, CLI tool, pre-commit hook, container base image or Terraform provider for the ship-it-safely lab (NFR-3), never guessing a version, SHA, digest or checksum. Load before adding or bumping any of them.
+description: Look up and pin the current version of a GitHub Action, CLI tool, pre-commit hook, container base image or Terraform provider for the ship-it-serverless lab (NFR-3), never guessing a version, SHA, digest or checksum. Load before adding or bumping any of them.
 ---
 
 # Pin versions (NFR-3)
@@ -47,8 +47,11 @@ Dependabot keeps them current after that.
 docker buildx imagetools inspect <image>:<tag> --format '{{json .Manifest.Digest}}'
 ```
 
-Pin the **index** digest (multi-arch list), not one platform's manifest, in one literal `FROM` line, so Dependabot
-can bump it. Python stays on the minor version that ADR 0007 fixes (only digest and patch updates).
+Pin the **index** digest (multi-arch list), not one platform's manifest, in one literal `FROM` or `COPY --from`
+line. Python stays on the minor version that ADR 0007 fixes (only digest and patch updates). This includes the
+Lambda Web Adapter (`public.ecr.aws/awsguru/aws-lambda-adapter:<tag>@sha256:<digest>`, check the release on
+`awslabs/aws-lambda-web-adapter`). Dependabot cannot read `public.ecr.aws`, so its `docker` ecosystem is off:
+bump both images by hand once a month (`build(docker)`), then `make verify`.
 
 ## Terraform providers and Terraform itself
 

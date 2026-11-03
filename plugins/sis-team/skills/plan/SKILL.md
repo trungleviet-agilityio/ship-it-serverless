@@ -1,7 +1,8 @@
 ---
 name: plan
-description: Settle the design of one phase of the ship-it-safely lab before any code is written. Spawns the solution-architect, saves its ADR to docs/adr/, and stops for the user's approval. Use as /sis-team:plan <phase>.
+description: Settle the design of one phase of the ship-it-serverless lab before any code is written. Spawns the solution-architect, saves its ADR to docs/adr/, and stops for the user's approval. Use as /sis-team:plan <phase>.
 argument-hint: <phase number>
+disable-model-invocation: true
 ---
 
 # /sis-team:plan

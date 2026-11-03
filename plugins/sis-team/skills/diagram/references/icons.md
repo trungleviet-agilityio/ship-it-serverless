@@ -1,4 +1,4 @@
-# draw.io icons for ship-it-safely
+# draw.io icons for ship-it-serverless
 
 Every name below was rendered with the draw.io CLI and checked by eye. `check_drawio.py` rejects any
 `mxgraph.aws4.*` name that is not in this file, so add a name here only after rendering it.
