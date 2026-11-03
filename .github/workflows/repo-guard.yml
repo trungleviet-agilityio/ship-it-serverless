@@ -61,3 +61,7 @@ jobs:
 
       - name: CI helper self-tests
         run: scripts/ci/selftest.sh
+
+      # The Claude Code hook that blocks apply, merges, gh api writes, pushes to main and secret file reads (ADR 0013).
+      - name: sis-team guard tests
+        run: python3 -I -m unittest discover -s plugins/sis-team/scripts -p 'test_*.py'

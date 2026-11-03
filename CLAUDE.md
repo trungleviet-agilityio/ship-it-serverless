@@ -13,6 +13,8 @@ progress tracker are the maintainer's working notes, kept outside the repo; thei
 - Never run `terraform apply`, `terraform destroy`, `terraform import`, `terraform state rm|mv|push`,
   `aws secretsmanager put-secret-value|get-secret-value`, or `aws iam create-access-key`. Prepare the command;
   the user runs it (NFR-9). Guardrails: `.claude/settings.json` deny rules and the `sis-team` guard hook.
+- Never merge a PR, run or rerun a workflow, approve a deployment, write through `gh api`, or push to `main`.
+  Push a feature branch and open a PR; the owner merges and approves (ADR 0013).
 - This shell has no AWS credentials on purpose. Do not ask for them or export a profile.
 - Never commit secrets, a real `.env`, `*.tfstate`, `*.tfvars` holding account IDs, or plan files.
 - Look up current versions and commit SHAs for actions and tools; never guess them (NFR-3).

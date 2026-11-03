@@ -15,7 +15,27 @@
       "Bash(gh secret set *)",
       "Read(./app/.env)",
       "Read(./**/*.tfstate)",
-      "Read(./**/*.tfstate.backup)"
+      "Read(./**/*.tfstate.backup)",
+      "Bash(gh pr merge *)",
+      "Bash(gh workflow run *)",
+      "Bash(gh run rerun *)",
+      "Bash(gh variable set *)",
+      "Bash(gh repo edit *)",
+      "Bash(gh auth token*)",
+      "Bash(gh auth refresh *)",
+      "Bash(git push --force *)",
+      "Bash(git push -f *)",
+      "Bash(git push origin main)",
+      "Bash(git push origin main *)",
+      "Read(./.env)",
+      "Read(./**/*.tfplan)",
+      "Read(./**/*.auto.tfvars)",
+      "Read(./**/*.tfvars.json)",
+      "Read(./**/*.tfbackend)",
+      "Read(./infra/terraform/bootstrap/accounts/*.tfvars)",
+      "Read(./**/.terraform/**)",
+      "Read(~/.aws/**)",
+      "Read(~/.ssh/**)"
     ]
   },
   "enabledPlugins": {
