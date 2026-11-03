@@ -55,7 +55,7 @@ variable "github_owner" {
 variable "github_repo" {
   type        = string
   description = "GitHub repository name."
-  default     = "ship-it-safely"
+  default     = "ship-it-serverless"
 
   validation {
     condition     = can(regex("^[A-Za-z0-9._-]+$", var.github_repo))

@@ -8,7 +8,7 @@ Infrastructure as code under `infra/terraform/`. Part of the [standards index](R
   from 1.11; providers pinned with `~>`),
   `variables.tf`, `outputs.tf`, and resource files split by concern (`oidc.tf`, `iam_plan.tf`).
 - Environments differ only through `terraform.tfvars` (FR-6). Shared logic lives in
-  `modules/app-ecs`.
+  `modules/app-lambda` (ADR 0012).
 - Roots (`bootstrap/`, `envs/<env>/`) own `providers.tf`, the partial `backend.tf` and their inputs.
   `envs/<env>` stays thin: one `module` call plus variables and outputs. Modules declare
   `required_providers` but never a `provider` or `backend` block.
@@ -43,19 +43,19 @@ Infrastructure as code under `infra/terraform/`. Part of the [standards index](R
 - Build policies with `data "aws_iam_policy_document"`, not inline JSON strings.
 - No `*` in `Action` or `Resource` of an Allow unless the API does not support resource-level
   permissions; then add a comment naming the API and, where possible, a condition. The approved
-  list (ADR 0002, B20): `ec2:Describe*`, `elasticloadbalancing:Describe*`,
-  `logs:DescribeLogGroups`, `ecs:DescribeTaskDefinition`, `ecs:DeregisterTaskDefinition`,
-  `ecr:GetAuthorizationToken`. A `terraform test` enforces it.
+  list (ADR 0002 B20, rewritten by ADR 0012): `ecr:GetAuthorizationToken`, `cloudwatch:GetMetricStatistics`,
+  `logs:DescribeLogGroups` and the CloudWatch Logs delivery and resource-policy actions that HTTP API access
+  logging needs. A `terraform test` enforces it.
 - Action wildcards are fine in Deny statements, where they widen protection.
-- EC2 resources have random IDs, so scope EC2 writes by tag (`aws:RequestTag`/`aws:ResourceTag`
-  on `Project` and `Env`) instead of by ARN.
-  Keep `default_tags` on every provider so standalone security group rules are tagged too;
-  untagged rules cannot be changed or deleted by the apply role.
+- Resources with random IDs (HTTP APIs) are scoped by the region-wide `/apis` path; Lambda, logs, alarms and
+  roles are scoped by `<prefix>-<env>-` names.
+- The deploy role holds no `iam:PassRole` at all and carries an explicit Deny on it; `lambda:DeleteFunction`
+  is allowed only on qualified ARNs (`function:<name>:*`), so it prunes versions but never deletes the function.
 - IAM roles that a GitHub role creates carry the bootstrap permissions boundary
   (`iam:PermissionsBoundary` condition).
 - `iam:PassRole` names the exact role ARNs and sets `iam:PassedToService`.
 - The deploy role may call `secretsmanager:DescribeSecret` (metadata only) on the one app secret, matched as
-  `sis/<env>/app-api-key-??????`, so the deploy preflight can refuse a secret with no value (ADR 0006 G14).
+  `<prefix>/<env>/app-api-key-??????`, so the deploy preflight can refuse a secret with no value (ADR 0006 G14).
 - Plan, apply and deploy roles carry an explicit deny on `secretsmanager:GetSecretValue`
   (FR-3, FR-4, FR-5), through the shared guardrail policy.
 - OIDC trust policies match `sub` exactly (`StringEquals`, never a wildcard on the repo) and check

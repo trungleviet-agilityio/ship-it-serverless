@@ -118,7 +118,7 @@ class GetSecretValueTest(unittest.TestCase):
 
     def test_signed_request_returns_secret_string(self) -> None:
         fake = FakeSecretsManager().start(self)
-        arn = "arn:aws:secretsmanager:ap-southeast-1:000000000000:secret:sis-dev-app-key-AbCdEf"
+        arn = "arn:aws:secretsmanager:ap-southeast-1:123456789012:secret:sis-dev-app-key-AbCdEf"
         value = aws_sigv4.get_secret_value(arn, "ap-southeast-1", CREDS, endpoint=fake.url)
         self.assertEqual(value, "s3cret")
         self.assertEqual(len(fake.requests), 1)

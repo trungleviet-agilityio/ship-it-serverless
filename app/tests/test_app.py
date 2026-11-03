@@ -21,7 +21,7 @@ from test_aws_sigv4 import FakeSecretsManager  # noqa: E402
 
 KEY = "fake-test-key-123"
 DIGEST = "sha256:" + "ab" * 32
-ARN = "arn:aws:secretsmanager:ap-southeast-1:000000000000:secret:sis-dev-app-key-AbCdEf"
+ARN = "arn:aws:secretsmanager:ap-southeast-1:123456789012:secret:sis-dev-app-key-AbCdEf"
 REAL_URLOPEN = urllib.request.urlopen
 
 
