@@ -346,7 +346,10 @@ AWS_PROFILE=sls-dev-admin aws secretsmanager list-secrets --region ap-southeast-
 
 Expect: empty.
 
-The bootstrap (and its ECR images) stays until the end of the lab. Removing it follows the template's order:
+The bootstrap (and its ECR images) stays until the end of the lab. To **re-create** an env later: approve the
+Terraform apply, then right away run a release of a known-green SHA (dev: **App Deploy** with `mode` = `rollback` and
+that SHA; prod: **App Promote** with that SHA). Until then the re-created function serves the newest image in ECR,
+which could be an aborted canary (ADR 0012 R8). Removing it follows the template's order:
 migrate the bootstrap state back to local, empty the state bucket including all versions, then a saved
 `plan -destroy` and its apply, as admin, per account (ECR goes with it: `force_delete`).
 

@@ -146,9 +146,11 @@ deploy stops green with a notice when the function does not exist yet).
 
 **Choice: bootstrap.** Repository `<prefix>-<env>-app`: IMMUTABLE tags, scan on push, `force_delete` (bootstrap
 destroy only), lifecycle keeps the last 20 images. Repository policy: `LambdaPull` (`lambda.amazonaws.com`, pull
-actions, `aws:sourceArn` like `arn:aws:lambda:<region>:<account>:function:<prefix>-<env>-app*`) and, in dev when
+actions, `ArnLike aws:sourceArn` exactly `function:<prefix>-<env>-app` and `function:<prefix>-<env>-app:*`; no
+`aws:SourceAccount`, which is not documented for this pull and would fail closed) and, in dev when
 `promotion_target_account_id` is set, `PromotionPull` for the prod deploy role only (ADR 0008 P9, moved here from
-the module). Lambda never edits the policy: no role holds `ecr:SetRepositoryPolicy` except the admin bootstrap.
+the module). Lambda never edits the policy: no role holds `ecr:SetRepositoryPolicy` except the admin bootstrap (the apply
+and deploy roles hold `ecr:GetRepositoryPolicy`, which Lambda checks).
 
 ### L5. Secret delivery (owner Q1)
 
@@ -247,7 +249,11 @@ read (`DescribeImages`, `DescribeRepositories`, plus `BatchGetImage`, `GetDownlo
 never `SetRepositoryPolicy` (bootstrap owns the policy and it already allows Lambda); `lambda:AddPermission` only for
 `lambda:Principal = apigateway.amazonaws.com`; the secret shell; IAM role CRUD on exactly `<prefix>-<env>-app-exec` (no wildcard
 role pattern, test M1) with the bootstrap boundary required; `iam:PassRole` **only** on `<prefix>-<env>-app-exec` with `iam:PassedToService =
-lambda.amazonaws.com`. EC2, ELB, ECS and ECR-write statements are deleted. Plan role unchanged.
+lambda.amazonaws.com`. Conditions sit only on actions that support them: `iam:PermissionsBoundary` on
+`CreateRole`, `PutRolePolicy`, `DeleteRolePolicy`, `PutRolePermissionsBoundary`; `UpdateAssumeRolePolicy`, `DeleteRole`
+and role metadata actions are unconditioned on the one exact role ARN (a condition on an unsupported key is an
+implicit deny), and `lambda:SourceFunctionArn` keeps a re-trusted role away from the secret. EC2, ELB, ECS and
+ECR-write statements are deleted. Plan role unchanged.
 
 **Execution role** `<prefix>-<env>-app-exec` (Terraform, under the renamed boundary `<prefix>-<env>-app-boundary`):
 `logs:CreateLogStream` and `logs:PutLogEvents` on the function's log group; `secretsmanager:GetSecretValue` on the one
