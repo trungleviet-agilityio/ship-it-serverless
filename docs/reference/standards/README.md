@@ -8,7 +8,7 @@ wins; update the standard in the same PR.
 
 | File | Covers | Paths |
 |---|---|---|
-| [`application.md`](application.md) | Python, the Dockerfile, the Fargate runtime | `app/` |
+| [`application.md`](application.md) | Python, the Dockerfile, the Lambda runtime | `app/` |
 | [`terraform.md`](terraform.md) | Layout, READMEs, naming, IAM, secrets and state, tests | `infra/terraform/` |
 | [`ci-cd.md`](ci-cd.md) | Naming, supply chain, runner hardening, credentials, environments, reuse | `.github/` |
 | [`tooling.md`](tooling.md) | Tool versions, the `Makefile`, shell and Python helper scripts | `mise.toml`, `Makefile`, `scripts/` |
