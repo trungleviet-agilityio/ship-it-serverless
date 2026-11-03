@@ -2,6 +2,12 @@
 # passes it; missing data (no traffic) is not an alarm.
 
 # Errors of the version(s) behind `live`: the Resource dimension "<function>:<alias>" selects the alias.
+# What it counts: Lambda Errors are invocations that fail in the function (a crash, an unhandled error, a
+# timeout). With the Lambda Web Adapter an HTTP 500 from the app is a successful invoke that returns a 500 response,
+# so it is not an Error; the api_5xx alarm below is the signal for app 500s.
+# The alias-level metric (FunctionName + Resource = <function>:live) aggregates every version behind the alias,
+# canary weights included: during a canary it mixes old and new versions. The canary judgment (L7) reads Errors by
+# ExecutedVersion instead.
 resource "aws_cloudwatch_metric_alarm" "lambda_errors" {
   alarm_name          = local.names.alarm_errors
   alarm_description   = "Lambda Errors on ${local.names.function}:${local.names.alias} (ADR 0012 L10)"

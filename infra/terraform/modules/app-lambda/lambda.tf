@@ -1,9 +1,14 @@
 # The web function (ADR 0012 L1, L3): the app image with the Lambda Web Adapter extension, package type Image.
 # Terraform owns the shape (memory, timeout, role, env, logging, concurrency); App Deploy owns which image and which
-# version serve (ADR 0005 F2 as rewritten by L3), so image_uri and IMAGE_DIGEST are ignored after the create.
+# version serve (ADR 0005 F2 as rewritten by L3), so image_uri, IMAGE_DIGEST and description are ignored after the
+# create.
 resource "aws_lambda_function" "app" {
   function_name = local.names.function
-  description   = "Board web app behind the Lambda Web Adapter (ADR 0012)"
+  # Seed only. App Deploy writes "sha=<sha> digest=<digest>" together with IMAGE_DIGEST before every PublishVersion
+  # (L6, L7): PublishVersion publishes nothing new when code and configuration are unchanged, so the description is
+  # what makes each release a distinct version, and the rollback lookup (L8) matches it exactly. This seed never
+  # has that form, so the version published at create is never mistaken for a release.
+  description   = "initial image (terraform create) ${local.initial_image_digest}"
   role          = aws_iam_role.exec.arn
   package_type  = "Image"
   image_uri     = local.initial_image_uri
@@ -19,16 +24,7 @@ resource "aws_lambda_function" "app" {
   publish = true
 
   environment {
-    variables = {
-      APP_ENV = var.env
-      # Lambda Web Adapter (Finding 1): the app listens on 8080 and is ready when /health answers.
-      AWS_LWA_PORT                 = "8080"
-      AWS_LWA_READINESS_CHECK_PATH = "/health"
-      # The app reads the value itself (L5); this is the ARN, never the value.
-      APP_API_KEY_SECRET_ARN = aws_secretsmanager_secret.app.arn
-      # L6: the deploy sets this before every PublishVersion; Terraform only seeds it.
-      IMAGE_DIGEST = local.initial_image_digest
-    }
+    variables = local.function_environment
   }
 
   logging_config {
@@ -40,8 +36,16 @@ resource "aws_lambda_function" "app" {
   depends_on = [aws_cloudwatch_log_group.lambda, aws_iam_role_policy.exec]
 
   lifecycle {
-    # L3: App Deploy swaps the image by digest and sets IMAGE_DIGEST; a Terraform apply must not revert either.
-    ignore_changes = [image_uri, environment[0].variables["IMAGE_DIGEST"]]
+    # L3: App Deploy swaps the image by digest and sets IMAGE_DIGEST and the description; a Terraform apply must not
+    # revert any of them.
+    ignore_changes = [image_uri, environment[0].variables["IMAGE_DIGEST"], description]
+
+    # FR-8, L5: the key value never reaches the function configuration (GetFunctionConfiguration shows env values
+    # to anyone who may read the function, and Terraform state would hold it). Only its ARN does.
+    precondition {
+      condition     = !contains(keys(local.function_environment), "APP_API_KEY")
+      error_message = "The function environment must not contain APP_API_KEY: the app reads the value itself through APP_API_KEY_SECRET_ARN (ADR 0012 L5, FR-8)."
+    }
   }
 }
 

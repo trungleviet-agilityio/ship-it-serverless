@@ -9,9 +9,12 @@ resource "aws_apigatewayv2_api" "this" {
 # AWS_PROXY on the alias ARN, so traffic always follows `live` (canary weights included). For an HTTP API the Lambda
 # integration URI is the function ARN, here qualified with the alias. Payload 2.0 is what the Lambda Web Adapter
 # reads for HTTP APIs. 29 s is below the HTTP API maximum of 30 s and far above the 10 s function timeout.
+# integration_method is the method API Gateway uses to call Lambda (Invoke is always POST), not the client's method;
+# the provider docs say it must be set unless integration_type is MOCK.
 resource "aws_apigatewayv2_integration" "app" {
   api_id                 = aws_apigatewayv2_api.this.id
   integration_type       = "AWS_PROXY"
+  integration_method     = "POST"
   integration_uri        = aws_lambda_alias.live.arn
   payload_format_version = "2.0"
   timeout_milliseconds   = 29000

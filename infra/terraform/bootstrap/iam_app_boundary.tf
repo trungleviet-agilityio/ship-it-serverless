@@ -15,12 +15,30 @@ data "aws_iam_policy_document" "app_boundary" {
     ]
   }
 
-  # The app reads its API key itself with SigV4 (ADR 0012 L5). The CI roles never can (guardrail G1).
+  # The app reads its API key itself with SigV4 (ADR 0012 L5), and only from inside the function: Lambda adds
+  # lambda:SourceFunctionArn (always the unqualified function ARN) to AWS API requests made from the function's
+  # execution environment, and the key works in identity policies and boundaries (ArnEquals). Source: Lambda
+  # Developer Guide, "Using source function ARN to control function access behavior"
+  # (https://docs.aws.amazon.com/lambda/latest/dg/permissions-source-function-arn.html).
+  # What this does and does not stop:
+  # - The CI roles cannot read a value directly: guardrail G1 denies GetSecretValue to all three.
+  # - The apply role may change the execution role's trust (UpdateAssumeRolePolicy) or re-create the role with a
+  #   foreign trust. Whoever then assumes it still cannot read the secret: a request from outside the function
+  #   carries no lambda:SourceFunctionArn, so this statement does not match and the boundary denies.
+  # - The deploy role can run new code as the execution role (UpdateFunctionCode, then invoke), and that code can
+  #   read the secret. Accepted risk (ADR 0012 L9, R4): the deploy role is gated by the main-only OIDC trust, the
+  #   GitHub environment approval and the pinned workflow file (job_workflow_ref).
   statement {
     sid       = "AppSecretRead"
     effect    = "Allow"
     actions   = ["secretsmanager:GetSecretValue"]
     resources = [local.secret_pattern]
+
+    condition {
+      test     = "ArnEquals"
+      variable = "lambda:SourceFunctionArn"
+      values   = [local.function_arn_app]
+    }
   }
 }
 

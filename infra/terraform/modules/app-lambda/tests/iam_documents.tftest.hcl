@@ -1,7 +1,7 @@
 # The execution role and its inline policy carry the documents built for them, and those documents grant exactly
 # what ADR 0012 L9 lists (least privilege). Policy attributes are unknown at plan with a mock provider, so this file
 # applies against the mock: still offline. It also proves that a later image digest does not revert what App Deploy
-# set (ignore_changes on image_uri and IMAGE_DIGEST, L3).
+# set (ignore_changes on image_uri, IMAGE_DIGEST and description, L3).
 mock_provider "aws" {
   mock_data "aws_caller_identity" {
     defaults = { account_id = "123456789012" }
@@ -92,7 +92,9 @@ run "role_uses_the_rendered_documents" {
   }
 }
 
-run "trust_is_lambda_in_this_account" {
+# C5: Lambda only, and no condition. An undocumented aws:SourceAccount or aws:SourceArn would fail closed and stop
+# the function from assuming its role; PassRole on this role belongs to this account's apply role alone.
+run "trust_is_lambda_only_without_conditions" {
   command = apply
 
   assert {
@@ -102,16 +104,16 @@ run "trust_is_lambda_in_this_account" {
         toset(s.actions),
         toset(flatten([for p in s.principals : p.type])),
         toset(flatten([for p in s.principals : p.identifiers])),
-        [for c in s.condition : [c.test, c.variable, toset(c.values)]],
+        length(s.condition == null ? [] : s.condition),
       ]
       ] == [[
         "Allow",
         toset(["sts:AssumeRole"]),
         toset(["Service"]),
         toset(["lambda.amazonaws.com"]),
-        [["StringEquals", "aws:SourceAccount", toset(["123456789012"])]],
+        0,
     ]]
-    error_message = "only lambda.amazonaws.com may assume the role, on behalf of this account (aws:SourceAccount)"
+    error_message = "exactly lambda.amazonaws.com may assume the role, with no condition (no aws:SourceAccount, no aws:SourceArn)"
   }
 }
 
@@ -141,6 +143,24 @@ run "exec_policy_is_least_privilege" {
   }
 }
 
+# M3a: the secret read only works from inside this function (unqualified ARN, ArnEquals), never for someone else
+# holding the role's credentials. The log statement has no condition.
+run "secret_read_requires_the_source_function" {
+  command = apply
+
+  assert {
+    condition = {
+      for s in data.aws_iam_policy_document.exec.statement : s.sid => [
+        for c in(s.condition == null ? [] : s.condition) : [c.test, c.variable, toset(c.values)]
+      ]
+      } == {
+      LogsWriteOneGroup = []
+      ReadTheAppSecret  = [["ArnEquals", "lambda:SourceFunctionArn", toset(["arn:aws:lambda:ap-southeast-1:123456789012:function:sis-dev-app"])]]
+    }
+    error_message = "GetSecretValue needs ArnEquals lambda:SourceFunctionArn = the unqualified function ARN, and only that statement has a condition"
+  }
+}
+
 # L3: a newer image in ECR (pushed by App Deploy) must not make Terraform swap the image or reset IMAGE_DIGEST.
 run "later_digest_is_ignored" {
   command = plan
@@ -161,6 +181,31 @@ run "later_digest_is_ignored" {
   assert {
     condition     = aws_lambda_alias.live.function_version == "1"
     error_message = "the alias keeps the version App Deploy set (ignore_changes)"
+  }
+}
+
+# B1: App Deploy writes the description ("sha=<sha> digest=<digest>") before every PublishVersion. A later image
+# changes the seed Terraform would compute, and that change must not be planned, while memory still is.
+run "later_description_is_ignored" {
+  command = plan
+
+  variables {
+    memory_mb = 1024
+  }
+
+  override_data {
+    target = data.aws_ecr_image.app
+    values = { image_digest = "sha256:2222222222222222222222222222222222222222222222222222222222222222" }
+  }
+
+  assert {
+    condition     = aws_lambda_function.app.description == "initial image (terraform create) sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    error_message = "the description keeps the applied value (ignore_changes): the deploy owns it"
+  }
+
+  assert {
+    condition     = aws_lambda_function.app.memory_size == 1024
+    error_message = "memory changes are still planned next to the ignored description"
   }
 }
 

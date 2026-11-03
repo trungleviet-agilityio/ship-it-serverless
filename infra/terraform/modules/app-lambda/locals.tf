@@ -33,4 +33,20 @@ locals {
   initial_image_uri    = "${local.ecr_repository_url}@${local.initial_image_digest}"
 
   alarm_actions = var.alarm_topic_arn == null ? [] : [var.alarm_topic_arn]
+
+  # Unqualified function ARN, built (not read from the function) because the execution role policy must exist
+  # before the function. lambda:SourceFunctionArn always carries this unqualified form (see iam.tf).
+  function_arn = "arn:${local.partition}:lambda:${var.aws_region}:${local.account_id}:function:${local.names.function}"
+
+  # The function environment (L3). APP_API_KEY is never here: the lambda.tf precondition refuses it.
+  function_environment = {
+    APP_ENV = var.env
+    # Lambda Web Adapter (Finding 1): the app listens on 8080 and is ready when /health answers.
+    AWS_LWA_PORT                 = "8080"
+    AWS_LWA_READINESS_CHECK_PATH = "/health"
+    # The app reads the value itself (L5); this is the ARN, never the value.
+    APP_API_KEY_SECRET_ARN = aws_secretsmanager_secret.app.arn
+    # L6: the deploy sets this before every PublishVersion; Terraform only seeds it.
+    IMAGE_DIGEST = local.initial_image_digest
+  }
 }

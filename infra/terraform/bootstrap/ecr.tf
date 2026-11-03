@@ -46,9 +46,12 @@ resource "aws_ecr_lifecycle_policy" "app" {
 }
 
 data "aws_iam_policy_document" "ecr_repository" {
-  # Lambda pulls the image as the service principal (Finding 5). aws:sourceArn limits it to this env's function,
-  # its versions and aliases (confused deputy protection). Lambda adds a statement like this itself only when the
-  # caller holds ecr:SetRepositoryPolicy; no CI role does, so this statement is the only way in.
+  # Lambda pulls the image as the service principal (Finding 5). aws:sourceArn limits it to this env's function and
+  # its qualified ARNs (versions, aliases): exact values with ArnLike, so a sibling such as <name>-app2 never
+  # matches (confused deputy protection). Lambda adds a statement like this itself only when the caller holds
+  # ecr:SetRepositoryPolicy; no CI role does, so this statement is the only way in.
+  # No aws:SourceAccount: it is not documented for this Lambda pull, and a key the service does not send fails
+  # closed, which would block every pull (create, code update, re-optimization). The ARNs already name this account.
   statement {
     sid     = "LambdaPull"
     effect  = "Allow"
@@ -60,9 +63,9 @@ data "aws_iam_policy_document" "ecr_repository" {
     }
 
     condition {
-      test     = "StringLike"
+      test     = "ArnLike"
       variable = "aws:sourceArn"
-      values   = ["${local.svc_arn["lambda"]}:function:${local.resource_names.function}*"]
+      values   = [local.function_arn_app, "${local.function_arn_app}:*"]
     }
   }
 

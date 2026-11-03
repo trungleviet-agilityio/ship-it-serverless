@@ -15,6 +15,9 @@ data "aws_iam_policy_document" "deploy" {
     resources = ["*"] # No resource-level support
   }
 
+  # Push and read on the one repository. ecr:GetRepositoryPolicy: Lambda checks the repository policy for its pull
+  # statement during UpdateFunctionCode with an image (Lambda Developer Guide, "Create a function using a container
+  # image"). Read only: ecr:SetRepositoryPolicy stays with the bootstrap admin (L4).
   statement {
     sid    = "EcrPushOneRepo"
     effect = "Allow"
@@ -27,6 +30,7 @@ data "aws_iam_policy_document" "deploy" {
       "ecr:BatchGetImage",
       "ecr:GetDownloadUrlForLayer",
       "ecr:DescribeImages",
+      "ecr:GetRepositoryPolicy",
     ]
     resources = [local.ecr_repo_app]
   }

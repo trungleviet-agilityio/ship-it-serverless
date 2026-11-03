@@ -144,6 +144,42 @@ run "function_runs_the_image_by_digest" {
   }
 }
 
+# FR-8, L5: the key value never sits in the function configuration; only the secret ARN does.
+run "environment_never_holds_the_api_key" {
+  command = plan
+
+  assert {
+    condition = (
+      !contains(keys(one(aws_lambda_function.app.environment).variables), "APP_API_KEY")
+      && !contains(keys(local.function_environment), "APP_API_KEY")
+      && startswith(one(aws_lambda_function.app.environment).variables["APP_API_KEY_SECRET_ARN"], "arn:aws:secretsmanager:")
+    )
+    error_message = "APP_API_KEY must never be in the function environment; the app gets the secret through APP_API_KEY_SECRET_ARN"
+  }
+}
+
+# B1: the deploy owns the description after the create; Terraform only seeds one that never looks like a release.
+run "description_is_an_initial_seed" {
+  command = plan
+
+  assert {
+    condition = (
+      aws_lambda_function.app.description == "initial image (terraform create) sha256:1111111111111111111111111111111111111111111111111111111111111111"
+      && !strcontains(aws_lambda_function.app.description, "sha=")
+    )
+    error_message = "the create seeds the description with the initial digest, never in the deploy's sha=<sha> digest=<digest> form"
+  }
+}
+
+run "api_integration_method_is_post" {
+  command = plan
+
+  assert {
+    condition     = aws_apigatewayv2_integration.app.integration_method == "POST"
+    error_message = "the AWS_PROXY integration calls Lambda with POST (the provider requires a method unless the type is MOCK)"
+  }
+}
+
 run "reserved_concurrency_is_passed_through" {
   command = plan
 
@@ -176,11 +212,12 @@ run "api_invokes_the_alias_only" {
     condition = (
       aws_apigatewayv2_api.this.protocol_type == "HTTP"
       && aws_apigatewayv2_integration.app.integration_type == "AWS_PROXY"
+      && aws_apigatewayv2_integration.app.integration_method == "POST"
       && aws_apigatewayv2_integration.app.integration_uri == "arn:aws:lambda:ap-southeast-1:123456789012:function:sis-dev-app:live"
       && aws_apigatewayv2_integration.app.payload_format_version == "2.0"
       && aws_apigatewayv2_integration.app.timeout_milliseconds <= 30000
     )
-    error_message = "HTTP API with an AWS_PROXY integration on the alias ARN, payload 2.0, timeout within 30 s"
+    error_message = "HTTP API with an AWS_PROXY integration (method POST) on the alias ARN, payload 2.0, timeout within 30 s"
   }
 
   assert {
