@@ -48,13 +48,14 @@ verify: ## Build, smoke test and scan in one go (what app-ci runs)
 
 venv: .venv-ci/.installed ## Hash-locked CI venv (.venv-ci) for pre-commit and the YAML trigger check
 
-lint: .venv-ci/.installed ## pre-commit hooks on all files, plus hadolint, shellcheck, actionlint, the prefix and env parity guards and the CI helper self-tests
+lint: .venv-ci/.installed ## pre-commit hooks on all files, plus hadolint, shellcheck, actionlint, the prefix and env parity guards, the CI helper self-tests and the sis-team guard tests
 	pre-commit run --all-files
 	hadolint app/Dockerfile
 	shellcheck -x $$(find scripts -name '*.sh' | sort)
 	scripts/project.sh check
 	scripts/guard/env-parity.sh
 	scripts/ci/selftest.sh
+	$(PYTHON) -I -m unittest discover -s plugins/sis-team/scripts -p 'test_*.py'
 	$(if $(wildcard .github/workflows/*.yml),actionlint,@echo "no workflows yet, skipping actionlint")
 
 tf-check: ## Offline Terraform policy rules (tf/policy.sh), README check, fmt, validate and test (no AWS)

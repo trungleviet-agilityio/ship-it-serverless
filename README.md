@@ -39,7 +39,8 @@ table, generated from the agent files) and `/sis-team:diagram <topic>` (AWS arch
 
 Guardrails (ADR 0001, D8): no admin AWS credentials in the Claude Code shell, deny rules in
 `.claude/settings.json`, and a `PreToolUse` guard hook in the plugin. `terraform apply`/`destroy` and secret
-values are always handled by a human at the checkpoint.
+values are always handled by a human at the checkpoint. The hook also blocks PR merges, workflow dispatch,
+`gh api` writes (such as approving a deployment), pushes to `main` and reads of secret files (ADR 0013).
 
 ## Setup
 
@@ -92,7 +93,7 @@ Day to day, run everything through `make` (`make help` lists the targets):
 | `make venv` | Hash-locked CI venv in `.venv-ci` (PyYAML for the workflow trigger check); created once, then reused |
 | `make up` / `make down` | Run or stop the app on http://localhost:8080 (creates `app/.env` from the example) |
 | `make test` | App unit tests |
-| `make lint` | pre-commit hooks (including gitleaks, zizmor and the account-ID guard), hadolint, shellcheck, actionlint, CI helper self-tests |
+| `make lint` | pre-commit hooks (including gitleaks, zizmor and the account-ID guard), hadolint, shellcheck, actionlint, CI helper self-tests, sis-team guard tests |
 | `make tf-check` | Offline Terraform policy rules (with their self-test), README check, `fmt`, `validate`, `terraform test` (no AWS; uses a temporary data dir, so a real S3 `init` in the checkout does not break it) |
 | `make docs` | Regenerate the `terraform-docs` tables in Terraform READMEs |
 | `make verify` (or `make image` / `make smoke` / `make scan`) | Build the app image the way CI does, run it like Fargate (read-only, UID 10001, root-owned `/tmp`), scan it with Trivy (fixable HIGH or CRITICAL fails). The same recipe as `app-ci` (`scripts/image/verify.sh`). Not part of `make check` |
