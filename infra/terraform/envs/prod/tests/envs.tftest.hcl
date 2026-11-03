@@ -1,6 +1,7 @@
-# Every env root stays thin and consistent with bootstrap (ADR 0004, E16 to E18). Offline: nothing talks to AWS.
-# The same file runs in every envs/<env>/ (the parity guard keeps the copies identical, ADR 0008, P3): each expected
-# name is built from var.env, which the committed terraform.tfvars sets. Only the account ID (never committed) is set here.
+# Every env root stays thin and consistent with bootstrap (ADR 0004, E16 to E18; ADR 0012). Offline: nothing talks
+# to AWS. The same file runs in every envs/<env>/ (the parity guard keeps the copies identical, ADR 0008, P3): each
+# expected name is built from var.env and var.prefix, which the committed terraform.tfvars sets. Only the account ID
+# (never committed) is set here.
 mock_provider "aws" {
   override_during = plan
 
@@ -8,17 +9,18 @@ mock_provider "aws" {
     defaults = { account_id = "123456789012" }
   }
   mock_data "aws_partition" {
-    defaults = { partition = "aws" }
+    defaults = { partition = "aws", dns_suffix = "amazonaws.com" }
   }
   mock_data "aws_iam_policy_document" {
     defaults = { json = "{}" }
+  }
+  mock_data "aws_ecr_image" {
+    defaults = { image_digest = "sha256:1111111111111111111111111111111111111111111111111111111111111111" }
   }
 }
 
 variables {
   aws_account_id = "123456789012"
-  # Used only where terraform.tfvars sets promotion_target_env (dev); CI passes the real one.
-  promotion_target_account_id = "222222222222"
 }
 
 run "default_tags_match_bootstrap" {
@@ -26,7 +28,7 @@ run "default_tags_match_bootstrap" {
 
   assert {
     condition = local.default_tags == {
-      Project   = "ship-it-safely"
+      Project   = "ship-it-serverless"
       Env       = var.env
       ManagedBy = "terraform"
     }
@@ -47,13 +49,38 @@ run "committed_tfvars_plan_this_envs_stack" {
   command = plan
 
   assert {
-    condition     = module.app_ecs.cluster_name == "${var.prefix}-${var.env}-cluster" && module.app_ecs.service_name == "${var.prefix}-${var.env}-app"
+    condition = (
+      module.app_lambda.function_name == "${var.prefix}-${var.env}-app"
+      && module.app_lambda.alias_name == "live"
+      && module.app_lambda.ecr_repository_name == "${var.prefix}-${var.env}-app"
+      && module.app_lambda.secret_name == "${var.prefix}/${var.env}/app-api-key"
+      && module.app_lambda.lambda_log_group_name == "/aws/lambda/${var.prefix}-${var.env}-app"
+      && module.app_lambda.api_log_group_name == "/aws/apigateway/${var.prefix}-${var.env}-api"
+      && module.app_lambda.exec_role_name == "${var.prefix}-${var.env}-app-exec"
+    )
     error_message = "the committed tfvars must produce the bootstrap name contract for var.env"
   }
 
+  # ADR 0012 L1, L2, L10 lab values.
   assert {
-    condition     = module.app_ecs.secret_name == "${var.prefix}/${var.env}/app-api-key"
-    error_message = "secret shell name follows the contract"
+    condition = (
+      var.memory_mb == 512
+      && var.timeout_s == 10
+      && var.log_retention_days == 7
+      && var.api_throttle_rate_limit == 5
+      && var.api_throttle_burst_limit == 10
+    )
+    error_message = "the committed tfvars carry the ADR 0012 lab values (512 MB, 10 s, 7 days, 5/s, burst 10)"
+  }
+}
+
+# The alerts topic is bootstrap's (monitoring.tf): <prefix>-<env>-security-alerts in this account and region.
+run "alarms_go_to_the_bootstrap_topic" {
+  command = plan
+
+  assert {
+    condition     = local.alarm_topic_arn == "arn:aws:sns:${var.aws_region}:123456789012:${var.prefix}-${var.env}-security-alerts"
+    error_message = "the alarm topic ARN must name the bootstrap security alerts topic of this env"
   }
 }
 
@@ -64,20 +91,18 @@ run "root_outputs_are_exactly_the_account_free_set" {
   assert {
     condition = (
       toset([for m in regexall("(?m)^output \"([a-z_]+)\"", file("outputs.tf")) : m[0]]) == toset([
-        "alb_url", "cluster_name", "service_name", "task_family", "ecr_repository_name", "log_group_name", "secret_name",
+        "function_name", "alias_name", "api_endpoint", "ecr_repository_name", "secret_name",
       ])
-      && output.cluster_name != ""
+      && output.function_name != ""
     )
     error_message = "root outputs must be exactly this set; ARNs, the ECR URL and account IDs stay module outputs (public logs)"
   }
 
   assert {
     condition = (
-      output.cluster_name == "${var.prefix}-${var.env}-cluster"
-      && output.service_name == "${var.prefix}-${var.env}-app"
-      && output.task_family == "${var.prefix}-${var.env}-app"
+      output.function_name == "${var.prefix}-${var.env}-app"
+      && output.alias_name == "live"
       && output.ecr_repository_name == "${var.prefix}-${var.env}-app"
-      && output.log_group_name == "/ecs/sis-${var.env}-app"
       && output.secret_name == "${var.prefix}/${var.env}/app-api-key"
     )
     error_message = "output values must be the plain names from the bootstrap contract"
@@ -94,48 +119,11 @@ run "short_account_id_is_rejected" {
   expect_failures = [var.aws_account_id]
 }
 
-run "alb_ingress_defaults_to_open" {
+run "reserved_concurrency_is_off_by_default" {
   command = plan
-
-  variables {
-    alb_ingress_cidrs_json = ""
-  }
 
   assert {
-    condition     = nonsensitive(local.alb_ingress_cidrs) == ["0.0.0.0/0"]
-    error_message = "an empty secret must keep the ALB open"
+    condition     = var.reserved_concurrency == null
+    error_message = "reserved_concurrency stays unset in the committed tfvars (ADR 0012 L10, Finding 10)"
   }
-}
-
-run "alb_ingress_reads_the_json_secret" {
-  command = plan
-
-  variables {
-    alb_ingress_cidrs_json = "[\"198.51.100.7/32\"]"
-  }
-
-  assert {
-    condition     = nonsensitive(local.alb_ingress_cidrs) == ["198.51.100.7/32"]
-    error_message = "a JSON list must decode to the CIDR list"
-  }
-}
-
-run "alb_ingress_rejects_non_json" {
-  command = plan
-
-  variables {
-    alb_ingress_cidrs_json = "not json"
-  }
-
-  expect_failures = [var.alb_ingress_cidrs_json]
-}
-
-run "alb_ingress_rejects_ipv6" {
-  command = plan
-
-  variables {
-    alb_ingress_cidrs_json = "[\"::/0\"]"
-  }
-
-  expect_failures = [var.alb_ingress_cidrs_json]
 }

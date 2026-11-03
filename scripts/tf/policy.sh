@@ -87,9 +87,10 @@ report 2 "inline ingress/egress block under modules/ (use standalone rule resour
 report 2 "dynamic or list-valued ingress/egress under modules/ (use standalone rule resources)" \
   "$(scan '^[[:space:]]*(dynamic[[:space:]]+"(ingress|egress)"|(ingress|egress)[[:space:]]*=[[:space:]]*\[)' "$root/modules")"
 
-# (3) Inline role policies only; no managed ECS execution policy.
-report 3 "AmazonECSTaskExecutionRolePolicy is forbidden under modules/ (inline least-privilege policy)" \
-  "$(scan 'AmazonECSTaskExecutionRolePolicy' "$root/modules")"
+# (3) Inline role policies only; no managed Lambda execution policy (AWSLambdaBasicExecutionRole allows
+# logs:CreateLogGroup on *, ADR 0012 L9).
+report 3 "AWSLambda*ExecutionRole and AmazonECSTaskExecutionRolePolicy managed policies are forbidden under modules/ (inline least-privilege policy)" \
+  "$(scan '(AWSLambda[A-Za-z]*ExecutionRole|AmazonECSTaskExecutionRolePolicy)' "$root/modules")"
 report 3 "aws_iam_role_policy_attachment is forbidden under modules/ (inline policies only)" \
   "$(scan '^[[:space:]]*resource[[:space:]]+"aws_iam_role_policy_attachment"' "$root/modules")"
 
@@ -140,7 +141,7 @@ fi
 report 6 "provider or backend block under modules/ (modules take them from the root)" \
   "$(scan '^[[:space:]]*(provider|backend)[[:space:]]+"' "$root/modules")"
 
-# (7) Role trust: a module role may only be assumed by the ECS tasks service principal. Grep level, not a
+# (7) Role trust: a module role may only be assumed by a service principal (lambda.amazonaws.com). Grep level, not a
 # policy parser: in any module directory that declares an aws_iam_role, no "AWS" or "Federated" principal type
 # and no identifiers holding an ARN, :root or "*" may appear. Unquoted `AWS =` / `Federated =` keys and
 # `Principal = "*"` / `type = "*"` count too. Cross-account or user trust would show up as one of those.
@@ -151,11 +152,9 @@ if [ -d "$root/modules" ]; then
     trust_out="$trust_out$(scan '("AWS"|"Federated"|(^|[^A-Za-z_])(AWS|Federated)[[:space:]]*=|Principal[[:space:]]*=[[:space:]]*"\*"|type[[:space:]]*=[[:space:]]*"\*"|identifiers[[:space:]]*=.*(arn:|:root|"\*"))' "$mdir")"$'\n'
   done < <(grep -rlE --include='*.tf' --exclude-dir=.terraform '^[[:space:]]*resource[[:space:]]+"aws_iam_role"[[:space:]]' "$root/modules" 2>/dev/null | xargs -n1 dirname 2>/dev/null | sort -u)
   trust_out="$(printf '%s' "$trust_out" | grep -v '^$' || true)"
-  # The one allowed cross-account principal (ADR 0008 P9): the ECR repository policy in ecr.tf that lets the
-  # promotion target account pull. Exactly this line, in exactly that file; any other AWS principal still fails.
-  promo_line='[[:space:]]*Principal[[:space:]]*=[[:space:]]*\{[[:space:]]*AWS[[:space:]]*=[[:space:]]*"arn:\$\{local\.partition\}:iam::\$\{var\.promotion_target_account_id\}:root"[[:space:]]*\}[[:space:]]*$'
-  trust_out="$(printf '%s' "$trust_out" | grep -Ev "/ecr\.tf:[0-9]+:${promo_line}" || true)"
-  report 7 "role trust may only allow ecs-tasks.amazonaws.com (no AWS/Federated/wildcard principals, no arn: or :root identifiers)" "$trust_out"
+  # No exemption: the one cross-account principal (the promotion pull of ADR 0008 P9) lives in the admin-applied
+  # bootstrap/ecr.tf since ADR 0012 L4, and bootstrap is outside this rule.
+  report 7 "role trust may only allow a service principal such as lambda.amazonaws.com (no AWS/Federated/wildcard principals, no arn: or :root identifiers)" "$trust_out"
 fi
 
 # (8) Root outputs are public in apply logs (repo is public): envs/*/outputs.tf never references an ARN,

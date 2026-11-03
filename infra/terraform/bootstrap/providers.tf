@@ -2,10 +2,10 @@ provider "aws" {
   region              = var.aws_region
   allowed_account_ids = [var.aws_account_id]
 
-  # The apply role's EC2 conditions depend on these exact values (B7, B14).
+  # Identical to envs/<env> (NFR-8): Project, Env, ManagedBy on every resource that supports tags.
   default_tags {
     tags = {
-      Project   = "ship-it-safely"
+      Project   = local.tag_project
       Env       = var.env
       ManagedBy = "terraform"
     }

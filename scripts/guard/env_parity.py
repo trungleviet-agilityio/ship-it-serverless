@@ -11,15 +11,13 @@ envs/ (dot-directories ignored):
      generated terraform-docs block of README.md (it lists the versions);
   3. backend.tf has `key = "envs/<env>/terraform.tfstate"`, and terraform.tfvars has
      `env = "<env>"`;
-  4. vpc_cidr is unique across E;
-  5. bootstrap/accounts/<env>.tfvars.example exists;
-  6. the environment lists in the workflows hold exactly E: the choice of the terraform-iac
+  4. bootstrap/accounts/<env>.tfvars.example exists;
+  5. the environment lists in the workflows hold exactly E: the choice of the terraform-iac
      dispatch input `env`, one `plan-<env>` caller job of reusable-terraform-plan.yml per env, the
      terraform-destroy choice, and the `allowed_envs` of its confirm job;
-  7. a `plan-<env>` caller maps only secrets named `*_<ENV>` (upper case), so a copied caller
-     cannot plan one account with the credentials of another. One exception (ADR 0008 P9): when
-     terraform.tfvars sets `promotion_target_env = "<target>"`, the caller must also map
-     PROMOTION_TARGET_ACCOUNT_ID, and only from secrets.AWS_ACCOUNT_ID_<TARGET>.
+  6. a `plan-<env>` caller maps only secrets named `*_<ENV>` (upper case), so a copied caller
+     cannot plan one account with the credentials of another. There is no cross-env exception:
+     the promotion target moved to the admin-applied bootstrap (ADR 0012 L4), outside CI.
 
 Usage: python -I scripts/guard/env_parity.py [repo root]   (default: the current directory)
 Prints one violation per line on stdout. Exit codes: 0 holds, 1 violations, 2 usage error.
@@ -44,9 +42,6 @@ KEY_VALUE = re.compile(r'^\s*key\s*=\s*"([^"]*)"\s*$', re.MULTILINE)
 BACKEND_KEY = re.compile(r'^(\s*key\s*=\s*)"[^"]*"\s*$', re.MULTILINE)
 DOCS_BLOCK = re.compile(r"<!-- BEGIN_TF_DOCS -->.*<!-- END_TF_DOCS -->", re.DOTALL)
 ENV_LINE = re.compile(r'^env\s*=\s*"([^"]*)"\s*(#.*)?$', re.MULTILINE)
-PROMOTION_LINE = re.compile(r'^promotion_target_env\s*=\s*"([^"]*)"\s*(#.*)?$', re.MULTILINE)
-PROMOTION_KEY = "PROMOTION_TARGET_ACCOUNT_ID"
-CIDR_LINE = re.compile(r'^vpc_cidr\s*=\s*"([^"]*)"\s*(#.*)?$', re.MULTILINE)
 ALLOWED_ENVS = re.compile(r'^\s*allowed_envs="([^"]*)"\s*$', re.MULTILINE)
 SECRET_REF = re.compile(r"^\$\{\{\s*secrets\.([A-Za-z0-9_]+)\s*\}\}$")
 REUSABLE_PLAN = "./.github/workflows/reusable-terraform-plan.yml"
@@ -132,11 +127,6 @@ def _root_problems(name: str, root: Path, reference: dict[str, Path]) -> list[st
     return problems
 
 
-def _cidr(root: Path) -> str | None:
-    path = root / "terraform.tfvars"
-    return _single(CIDR_LINE, path.read_text(encoding="utf-8")) if path.is_file() else None
-
-
 def _list_problems(label: str, found: list[str], envs: list[str]) -> list[str]:
     problems = [f"env '{e}': missing from {label}" for e in envs if e not in found]
     problems += [
@@ -159,42 +149,15 @@ def _choice(document: Any, label: str) -> list[str]:
         raise ValueError(f"{label}: {e}") from e
 
 
-def _promotion_target(root: Path) -> str:
-    """The promotion_target_env of root/terraform.tfvars, or "" when unset (ADR 0008 P9)."""
-    path = root / "terraform.tfvars"
-    found = PROMOTION_LINE.findall(path.read_text(encoding="utf-8")) if path.is_file() else []
-    return found[0][0] if len(found) == 1 else ""
-
-
-def _secret_problems(job_id: str, env: str, job: dict[str, Any], target: str) -> list[str]:
-    """Every secret a plan caller maps is the repository secret of its own environment.
-
-    The one exception is the promotion target account, mapped from AWS_ACCOUNT_ID_<TARGET>.
-    """
+def _secret_problems(job_id: str, env: str, job: dict[str, Any]) -> list[str]:
+    """Every secret a plan caller maps is the repository secret of its own environment."""
     suffix = f"_{env.upper()}"
     mapped = job.get("secrets")
     if not isinstance(mapped, dict) or not mapped:
         return [f"{IAC}: job '{job_id}' must map its secrets by name"]
     problems = []
-    if target and PROMOTION_KEY not in mapped:
-        problems.append(
-            f"{IAC}: job '{job_id}' must map {PROMOTION_KEY} from secrets.AWS_ACCOUNT_ID_"
-            f"{target.upper()} (envs/{env} promotes to {target})"
-        )
     for key, value in mapped.items():
         ref = SECRET_REF.match(str(value))
-        if key == PROMOTION_KEY:
-            expected = f"AWS_ACCOUNT_ID_{target.upper()}" if target else None
-            if not ref or ref.group(1) != expected:
-                problems.append(
-                    f"{IAC}: job '{job_id}' maps {key} from {value!r}; "
-                    + (
-                        f"it must be secrets.{expected}"
-                        if expected
-                        else f"envs/{env} sets no promotion_target_env"
-                    )
-                )
-            continue
         if not ref or not ref.group(1).endswith(suffix):
             problems.append(
                 f"{IAC}: job '{job_id}' maps {key} from {value!r}; "
@@ -203,7 +166,7 @@ def _secret_problems(job_id: str, env: str, job: dict[str, Any], target: str) ->
     return problems
 
 
-def _workflow_problems(workflows: Path, envs: list[str], targets: dict[str, str]) -> list[str]:
+def _workflow_problems(workflows: Path, envs: list[str]) -> list[str]:
     problems: list[str] = []
     try:
         iac = _load(workflows / IAC)
@@ -232,7 +195,7 @@ def _workflow_problems(workflows: Path, envs: list[str], targets: dict[str, str]
             )
         if env not in envs:
             problems.append(f"{IAC}: job '{job_id}' plans '{env}', which has no envs/{env}/ root")
-        problems += _secret_problems(job_id, env, jobs[job_id], targets.get(env, ""))
+        problems += _secret_problems(job_id, env, jobs[job_id])
     confirm = (destroy.get("jobs") or {}).get("confirm") or {}
     script = "\n".join(
         str(s.get("run", "")) for s in confirm.get("steps") or [] if isinstance(s, dict)
@@ -256,15 +219,9 @@ def check(repo: Path) -> list[str]:
         return [f"envs/{REFERENCE} is the reference root and is missing"]
     reference = _files(envs_dir / REFERENCE)
     problems: list[str] = []
-    cidrs: dict[str, list[str]] = {}
     for env in envs:
         if env != REFERENCE:
             problems += _root_problems(env, envs_dir / env, reference)
-        cidr = _cidr(envs_dir / env)
-        if cidr is None:
-            problems.append(f"env '{env}': terraform.tfvars must have exactly one vpc_cidr line")
-        else:
-            cidrs.setdefault(cidr, []).append(env)
         example = repo / "infra/terraform/bootstrap/accounts" / f"{env}.tfvars.example"
         if not example.is_file():
             problems.append(
@@ -273,13 +230,7 @@ def check(repo: Path) -> list[str]:
     problem = _env_line_problem(REFERENCE, envs_dir / REFERENCE)
     if problem:
         problems.append(problem)
-    problems += [
-        f"vpc_cidr {c} is used by more than one env: {', '.join(sorted(e))}"
-        for c, e in cidrs.items()
-        if len(e) > 1
-    ]
-    targets = {env: _promotion_target(envs_dir / env) for env in envs}
-    problems += _workflow_problems(repo / ".github/workflows", envs, targets)
+    problems += _workflow_problems(repo / ".github/workflows", envs)
     return problems
 
 

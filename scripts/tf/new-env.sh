@@ -4,36 +4,30 @@
 # steps you run yourself (account, bootstrap, GitHub environment and secrets, the workflow wiring).
 #
 # It copies the tracked files of the source root (so the lock file is copied and local state, .terraform/ and
-# *.auto.tfvars never are) and rewrites only named keys: `env`, `vpc_cidr` and `promotion_target_env = ""` (only if the source has the
-# key; a new environment is never a promotion source), plus the `key` line of backend.tf. Every other line is byte-identical,
-# which the parity guard (scripts/guard/env-parity.sh) enforces afterwards.
+# *.auto.tfvars never are) and rewrites only named keys: `env` in terraform.tfvars and the `key` line of backend.tf.
+# Every other line is byte-identical, which the parity guard (scripts/guard/env-parity.sh) enforces afterwards.
 # It refuses on any doubt before writing, builds everything in temp paths next to the targets, then moves them in. It
 # never runs terraform, aws, gh or a git write, never calls the network, and never takes or prints an account ID.
 #
-# Usage: scripts/tf/new-env.sh <env> [--from <env>] [--cidr 10.N.0.0/16] [--dry-run]
-#        make new-env ENV=<env> [FROM=dev] [CIDR=...] [DRY_RUN=1]
+# Usage: scripts/tf/new-env.sh <env> [--from <env>] [--dry-run]
+#        make new-env ENV=<env> [FROM=dev] [DRY_RUN=1]
 # Exit codes: 0 created (or dry run shown), 1 refused, 2 usage.
 
 # shellcheck source=scripts/lib.sh
 source "$(dirname "$0")/../lib.sh"
 
-USAGE="usage: scripts/tf/new-env.sh <env> [--from <env>] [--cidr 10.N.0.0/16] [--dry-run]"
+USAGE="usage: scripts/tf/new-env.sh <env> [--from <env>] [--dry-run]"
 usage_error() {
   printf '%s\n' "$USAGE" >&2
   exit 2
 }
 
-env_name="" from="dev" cidr="" dry_run=0
+env_name="" from="dev" dry_run=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --from)
       [ $# -ge 2 ] || usage_error
       from="$2"
-      shift 2
-      ;;
-    --cidr)
-      [ $# -ge 2 ] || usage_error
-      cidr="$2"
       shift 2
       ;;
     --dry-run) dry_run=1; shift ;;
@@ -83,36 +77,9 @@ need_once() {
   [ "$(key_count "$1" "$2")" = 1 ] || die "source format changed: '$2' must be assigned exactly once in ${1#"$ROOT"/}; update scripts/tf/new-env.sh"
 }
 need_once "$src/terraform.tfvars" env
-need_once "$src/terraform.tfvars" vpc_cidr
 need_once "$src/backend.tf" key
 grep -Eq "^[[:space:]]*key[[:space:]]*=[[:space:]]*\"envs/${from}/terraform.tfstate\"" "$src/backend.tf" \
   || die "source format changed: the backend key of envs/${from} is not envs/${from}/terraform.tfstate"
-
-# promotion_target_env: reset to "" only if the source has the key.
-promo_count="$(key_count "$src/terraform.tfvars" promotion_target_env)"
-[ "$promo_count" -le 1 ] || die "source format changed: promotion_target_env is assigned more than once; update scripts/tf/new-env.sh"
-
-# CIDR: a /16 in 10.0.0.0/8 whose second octet no envs/*/terraform.tfvars uses.
-used_octets=" " max_octet=0 f="" c="" octet=""
-for f in "$envs_dir"/*/terraform.tfvars; do
-  [ -f "$f" ] || continue
-  [ "$(key_count "$f" vpc_cidr)" = 1 ] || die "cannot read vpc_cidr of ${f#"$ROOT"/} (expected one line)"
-  c="$(sed -nE 's/^[[:space:]]*vpc_cidr[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' "$f")"
-  [[ "$c" =~ ^10\.(0|[1-9][0-9]{0,2})\.0\.0/16$ ]] || die "vpc_cidr of ${f#"$ROOT"/} is not a 10.N.0.0/16 value: '${c}'"
-  octet="${BASH_REMATCH[1]}"
-  used_octets="${used_octets}${octet} "
-  if [ "$octet" -gt "$max_octet" ]; then max_octet="$octet"; fi
-done
-if [ -z "$cidr" ]; then
-  octet=$((max_octet + 10))
-  [ "$octet" -le 250 ] || die "no free 10.N.0.0/16 left below 10.250 (highest used: 10.${max_octet}); pass --cidr"
-  cidr="10.${octet}.0.0/16"
-else
-  [[ "$cidr" =~ ^10\.(0|[1-9][0-9]{0,2})\.0\.0/16$ ]] || die "--cidr must be a /16 inside 10.0.0.0/8 such as 10.50.0.0/16, got '${cidr}'"
-  octet="${BASH_REMATCH[1]}"
-  [ "$octet" -le 255 ] || die "--cidr has an octet above 255: '${cidr}'"
-  case "$used_octets" in *" ${octet} "*) die "--cidr ${cidr} overlaps an environment that uses 10.${octet}.0.0/16" ;; esac
-fi
 
 # The gitignored account file must be ignored before it is written.
 rel_account="infra/terraform/bootstrap/accounts/${env_name}.tfvars"
@@ -151,12 +118,7 @@ Next steps (you run these; this script never runs terraform, aws or gh):
      AWS_PROFILE=@PREFIX@-@ENV@-admin TF_DATA_DIR=.terraform-@ENV@ terraform -chdir=infra/terraform/bootstrap output -raw plan_role_arn | gh secret set AWS_PLAN_ROLE_ARN_@ENVUP@ --repo @SLUG@
      gh secret set AWS_ACCOUNT_ID --env @ENV@ --repo @SLUG@
      gh secret set AWS_ACCOUNT_ID_@ENVUP@ --repo @SLUG@
-   The last two prompt: paste <ENV_ACCOUNT_ID> each time. Then the ALB allow-list, a JSON list such as ["<YOUR_IP>/32"]:
-     gh secret set ALB_INGRESS_CIDRS --env @ENV@ --repo @SLUG@
-     gh secret set ALB_INGRESS_CIDRS_@ENVUP@ --repo @SLUG@
-   Paste the same list each time. The environment secret is required: the apply of @ENV@ fails while it is empty, so a
-   forgotten copy cannot open the ALB. To be open on purpose, set it to ["0.0.0.0/0"]. The repository secret feeds
-   the PR plan, which treats an unset value as open.
+   The last two prompt: paste <ENV_ACCOUNT_ID> each time.
 5. Wire the workflows (a reviewed diff; the parity guard checks it):
    a. .github/workflows/terraform-iac.yml: add the job below, and add @ENV@ to the options of the dispatch input env.
         plan-@ENV@:
@@ -176,9 +138,9 @@ Next steps (you run these; this script never runs terraform, aws or gh):
           secrets:
             AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID_@ENVUP@ }}
             AWS_PLAN_ROLE_ARN: ${{ secrets.AWS_PLAN_ROLE_ARN_@ENVUP@ }}
-            ALB_INGRESS_CIDRS: ${{ secrets.ALB_INGRESS_CIDRS_@ENVUP@ }}
    b. .github/workflows/terraform-destroy.yml: add @ENV@ to the options of the input env and to allowed_envs in the confirm job.
-   A push to main still applies dev only; apply @ENV@ with Run workflow on terraform-iac.
+   A push to main still applies dev only; apply @ENV@ with Run workflow on terraform-iac. The function is created
+   from an image that is already in the @ENV@ ECR repository (ADR 0012 L3), so push or promote an image first.
 6. make check   (the parity guard names anything missing)
 7. Open a pull request.
 EOF
@@ -189,8 +151,7 @@ describe_plan() {
   if [ "$dry_run" = 1 ]; then verb="would create"; fi
   log "new environment '${env_name}' from '${from}'"
   log "${verb} infra/terraform/envs/${env_name}/ (tracked files of envs/${from}/)"
-  log "  terraform.tfvars: env = \"${env_name}\", vpc_cidr = \"${cidr}\""
-  if [ "$promo_count" = 1 ]; then log "  terraform.tfvars: promotion_target_env = \"\""; fi
+  log "  terraform.tfvars: env = \"${env_name}\""
   log "  backend.tf: key = \"envs/${env_name}/terraform.tfstate\""
   log "${verb} infra/terraform/bootstrap/accounts/${env_name}.tfvars.example"
   log "${verb} infra/terraform/bootstrap/accounts/${env_name}.tfvars (gitignored, mode 600, placeholders)"
@@ -249,8 +210,6 @@ tfvars="$tmp_env/terraform.tfvars"
 } >"$tfvars.new"
 mv "$tfvars.new" "$tfvars"
 rewrite_value "$tfvars" env "$env_name"
-rewrite_value "$tfvars" vpc_cidr "$cidr"
-if [ "$promo_count" = 1 ]; then rewrite_value "$tfvars" promotion_target_env ""; fi
 rewrite_value "$tmp_env/backend.tf" key "envs/${env_name}/terraform.tfstate"
 
 # The account inputs: the source example with its header and placeholders renamed. The bootstrap `env` defaults to dev,

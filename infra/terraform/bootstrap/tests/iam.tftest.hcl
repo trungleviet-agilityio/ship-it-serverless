@@ -1,4 +1,4 @@
-# Permission policies: guardrails, plan, apply, deploy, boundary (B14 to B20).
+# Permission policies: guardrails, plan, apply, deploy, boundary (B14 to B20, ADR 0012 L9).
 mock_provider "aws" {
   override_during = plan
 
@@ -72,7 +72,7 @@ run "guardrails_deny_and_attach" {
         && toset(s.resources) == toset([
           "arn:aws:iam::123456789012:role/sis-dev-gha-*",
           "arn:aws:iam::123456789012:policy/sis-dev-gha-*",
-          "arn:aws:iam::123456789012:policy/sis-dev-ecs-boundary",
+          "arn:aws:iam::123456789012:policy/sis-dev-app-boundary",
           "arn:aws:iam::123456789012:oidc-provider/*",
         ])
         && alltrue([
@@ -167,35 +167,6 @@ run "plan_role" {
   }
 }
 
-run "pass_role_is_exact" {
-  command = plan
-
-  assert {
-    condition = alltrue(flatten([
-      for doc in [data.aws_iam_policy_document.apply, data.aws_iam_policy_document.deploy] : [
-        for s in doc.statement : (
-          toset(s.resources) == toset([
-            "arn:aws:iam::123456789012:role/sis-dev-ecs-exec",
-            "arn:aws:iam::123456789012:role/sis-dev-ecs-task",
-          ])
-          && anytrue([
-            for c in s.condition : c.test == "StringEquals" && c.variable == "iam:PassedToService" && toset(c.values) == toset(["ecs-tasks.amazonaws.com"])
-          ])
-        ) if contains(s.actions, "iam:PassRole")
-      ]
-    ]))
-    error_message = "every iam:PassRole must name the two ECS roles and set PassedToService"
-  }
-
-  assert {
-    condition = alltrue([
-      for doc in [data.aws_iam_policy_document.apply, data.aws_iam_policy_document.deploy] :
-      length([for s in doc.statement : s if contains(s.actions, "iam:PassRole")]) == 1
-    ])
-    error_message = "apply and deploy each have exactly one PassRole statement"
-  }
-}
-
 run "deploy_scope" {
   command = plan
 
@@ -205,6 +176,15 @@ run "deploy_scope" {
       if s.sid == "EcrPushOneRepo"
     ])
     error_message = "deploy ECR push resources must be exactly the one repository"
+  }
+
+  # B2: UpdateFunctionCode with an image needs ecr:GetRepositoryPolicy on the caller; read only, never Set.
+  assert {
+    condition = alltrue([
+      for s in data.aws_iam_policy_document.deploy.statement : contains(s.actions, "ecr:GetRepositoryPolicy")
+      if s.sid == "EcrPushOneRepo"
+    ])
+    error_message = "the deploy role reads the policy of its one repository (UpdateFunctionCode with an image)"
   }
 
   assert {
@@ -246,65 +226,6 @@ run "deploy_secret_metadata_only" {
   }
 }
 
-run "apply_iam_requires_boundary" {
-  command = plan
-
-  assert {
-    condition = alltrue([
-      for s in data.aws_iam_policy_document.apply.statement : anytrue([
-        for c in s.condition : c.test == "StringEquals" && c.variable == "iam:PermissionsBoundary" && toset(c.values) == toset(["arn:aws:iam::123456789012:policy/sis-dev-ecs-boundary"])
-      ]) if contains(s.actions, "iam:CreateRole")
-    ])
-    error_message = "iam:CreateRole needs the boundary condition"
-  }
-
-  # Per the IAM Service Authorization Reference all six actions support iam:PermissionsBoundary.
-  assert {
-    condition = alltrue([
-      for a in ["iam:CreateRole", "iam:PutRolePolicy", "iam:DeleteRolePolicy", "iam:PutRolePermissionsBoundary", "iam:UpdateAssumeRolePolicy", "iam:DeleteRole"] :
-      anytrue([
-        for s in data.aws_iam_policy_document.apply.statement : (
-          contains(s.actions, a)
-          && toset(s.resources) == toset(["arn:aws:iam::123456789012:role/sis-dev-ecs-exec", "arn:aws:iam::123456789012:role/sis-dev-ecs-task"])
-          && anytrue([for c in s.condition : c.variable == "iam:PermissionsBoundary"])
-        ) if s.effect == "Allow"
-      ])
-    ])
-    error_message = "every mutating IAM role action must sit under the boundary condition on exactly the two ecs role ARNs"
-  }
-
-  # No IAM write or read on roles may target a wildcard role pattern (M1).
-  assert {
-    condition = alltrue([
-      for s in data.aws_iam_policy_document.apply.statement : alltrue([for r in s.resources : !strcontains(r, "role/") || !strcontains(r, "*") || strcontains(r, "role/aws-service-role/")])
-      if s.effect == "Allow" && anytrue([for a in s.actions : startswith(a, "iam:") && a != "iam:CreateServiceLinkedRole"])
-    ])
-    error_message = "no IAM action may target a wildcard role pattern (service-linked roles excepted)"
-  }
-
-  assert {
-    condition = alltrue([
-      for s in data.aws_iam_policy_document.apply.statement : toset(s.resources) == toset(["arn:aws:iam::123456789012:role/sis-dev-ecs-exec", "arn:aws:iam::123456789012:role/sis-dev-ecs-task"])
-      if contains(["IamEcsRolesBounded", "IamEcsRolesRead", "PassEcsRoles"], s.sid)
-    ])
-    error_message = "ecs role statements must target exactly sis-dev-ecs-exec and sis-dev-ecs-task"
-  }
-
-  assert {
-    condition = anytrue([
-      for s in data.aws_iam_policy_document.apply.statement : s.effect == "Deny" && contains(s.actions, "iam:DeleteRolePermissionsBoundary")
-    ])
-    error_message = "apply must deny removing the boundary"
-  }
-
-  assert {
-    condition = alltrue([
-      for s in data.aws_iam_policy_document.apply.statement : !anytrue([for a in s.actions : startswith(a, "iam:Attach")])
-    ])
-    error_message = "apply must not attach managed policies"
-  }
-}
-
 run "apply_state_listing" {
   command = plan
 
@@ -318,285 +239,6 @@ run "apply_state_listing" {
       ) if contains(s.actions, "s3:ListBucket")
     ])
     error_message = "apply ListBucket must allow the state key and the workspace listing prefix env:/ (S3 backend)"
-  }
-}
-
-run "ecs_task_size_and_update_conditions" {
-  command = plan
-
-  assert {
-    condition = alltrue(flatten([
-      for doc in [data.aws_iam_policy_document.apply, data.aws_iam_policy_document.deploy] : [
-        for s in doc.statement : (
-          anytrue([for c in s.condition : c.test == "NumericLessThanEquals" && c.variable == "ecs:task-cpu" && toset(c.values) == toset(["512"])])
-          && anytrue([for c in s.condition : c.test == "NumericLessThanEquals" && c.variable == "ecs:task-memory" && toset(c.values) == toset(["1024"])])
-        ) if contains(s.actions, "ecs:RegisterTaskDefinition")
-      ]
-    ]))
-    error_message = "RegisterTaskDefinition needs ecs:task-cpu <= 512 and ecs:task-memory <= 1024 in apply and deploy"
-  }
-
-  assert {
-    condition = alltrue([
-      for doc in [data.aws_iam_policy_document.apply, data.aws_iam_policy_document.deploy] :
-      length([for s in doc.statement : s if contains(s.actions, "ecs:RegisterTaskDefinition")]) == 1
-    ])
-    error_message = "apply and deploy each have exactly one RegisterTaskDefinition statement"
-  }
-
-  assert {
-    condition = (
-      length([for s in data.aws_iam_policy_document.deploy.statement : s if contains(s.actions, "ecs:UpdateService")]) == 1
-      && alltrue([
-        for s in data.aws_iam_policy_document.deploy.statement : anytrue([
-          for c in s.condition : (
-            c.test == "ArnLike"
-            && c.variable == "ecs:task-definition"
-            && toset(c.values) == toset(["arn:aws:ecs:ap-southeast-1:123456789012:task-definition/sis-dev-app:*"])
-          )
-        ]) if contains(s.actions, "ecs:UpdateService")
-      ])
-    )
-    error_message = "deploy UpdateService must be limited to the sis-dev-app task definition family"
-  }
-}
-
-run "apply_ec2_tag_scoping" {
-  command = plan
-
-  # No create statement guarded by RequestTag may span the whole region.
-  assert {
-    condition = alltrue([
-      for s in data.aws_iam_policy_document.apply.statement : alltrue([for r in s.resources : !endswith(r, ":*")])
-      if s.effect == "Allow" && anytrue([for c in s.condition : startswith(c.variable, "aws:RequestTag/")])
-    ])
-    error_message = "RequestTag statements must name resource types, not the region-wide ec2 ARN"
-  }
-
-  # Authorize* never rides on a RequestTag condition and is gated by tags on the parent security group.
-  assert {
-    condition = alltrue([
-      for s in data.aws_iam_policy_document.apply.statement : (
-        !anytrue([for c in s.condition : startswith(c.variable, "aws:RequestTag/")])
-        && alltrue([
-          for r in s.resources : contains([
-            "arn:aws:ec2:ap-southeast-1:123456789012:security-group/*",
-            "arn:aws:ec2:ap-southeast-1:123456789012:security-group-rule/*",
-          ], r)
-        ])
-        && (
-          !contains(s.resources, "arn:aws:ec2:ap-southeast-1:123456789012:security-group/*")
-          || (
-            anytrue([for c in s.condition : c.test == "StringEquals" && c.variable == "aws:ResourceTag/Project" && toset(c.values) == toset(["ship-it-safely"])])
-            && anytrue([for c in s.condition : c.test == "StringEquals" && c.variable == "aws:ResourceTag/Env" && toset(c.values) == toset(["dev"])])
-          )
-        )
-      ) if s.effect == "Allow" && anytrue([for a in s.actions : startswith(a, "ec2:AuthorizeSecurityGroup")])
-    ])
-    error_message = "Authorize* may only target security-group/* (with ResourceTag Project and Env) and security-group-rule/*"
-  }
-
-  assert {
-    condition = (
-      length([for s in data.aws_iam_policy_document.apply.statement : s if contains(s.actions, "ec2:AuthorizeSecurityGroupIngress")]) == 2
-      && alltrue([
-        for s in data.aws_iam_policy_document.apply.statement : (
-          contains(s.actions, "ec2:AuthorizeSecurityGroupIngress") == contains(s.actions, "ec2:AuthorizeSecurityGroupEgress")
-        )
-      ])
-    )
-    error_message = "Authorize ingress and egress are granted together on the security group and on the rule"
-  }
-
-  # Child creates: RequestTag on the new resource type only, ResourceTag on the parent vpc.
-  assert {
-    condition = alltrue([
-      for s in data.aws_iam_policy_document.apply.statement : (
-        s.effect == "Allow"
-        && (
-          (
-            toset(s.resources) == toset(["arn:aws:ec2:ap-southeast-1:123456789012:vpc/*"])
-            && !anytrue([for c in s.condition : startswith(c.variable, "aws:RequestTag/")])
-            && anytrue([for c in s.condition : c.variable == "aws:ResourceTag/Project" && toset(c.values) == toset(["ship-it-safely"])])
-            && anytrue([for c in s.condition : c.variable == "aws:ResourceTag/Env" && toset(c.values) == toset(["dev"])])
-          )
-          || (
-            alltrue([for r in s.resources : contains([
-              "arn:aws:ec2:ap-southeast-1:123456789012:subnet/*",
-              "arn:aws:ec2:ap-southeast-1:123456789012:route-table/*",
-              "arn:aws:ec2:ap-southeast-1:123456789012:security-group/*",
-            ], r)])
-            && anytrue([for c in s.condition : c.variable == "aws:RequestTag/Project" && toset(c.values) == toset(["ship-it-safely"])])
-            && anytrue([for c in s.condition : c.variable == "aws:RequestTag/Env" && toset(c.values) == toset(["dev"])])
-          )
-        )
-      ) if anytrue([for a in s.actions : contains(["ec2:CreateSubnet", "ec2:CreateRouteTable", "ec2:CreateSecurityGroup"], a)])
-    ])
-    error_message = "CreateSubnet, CreateRouteTable and CreateSecurityGroup need RequestTag on the new resource and ResourceTag on the parent vpc"
-  }
-
-  assert {
-    condition = (
-      length([for s in data.aws_iam_policy_document.apply.statement : s if contains(s.actions, "ec2:CreateVpc")]) == 1
-      && alltrue([
-        for s in data.aws_iam_policy_document.apply.statement : (
-          toset(s.resources) == toset([
-            "arn:aws:ec2:ap-southeast-1:123456789012:vpc/*",
-            "arn:aws:ec2:ap-southeast-1:123456789012:internet-gateway/*",
-          ])
-          && anytrue([for c in s.condition : c.variable == "aws:RequestTag/Project"])
-          && anytrue([for c in s.condition : c.variable == "aws:RequestTag/Env"])
-        ) if contains(s.actions, "ec2:CreateVpc")
-      ])
-    )
-    error_message = "CreateVpc and CreateInternetGateway use RequestTag on vpc/* and internet-gateway/*"
-  }
-
-  # Tag-on-create stays in sync with the create actions.
-  assert {
-    condition = alltrue([
-      for s in data.aws_iam_policy_document.apply.statement : (
-        toset(flatten([for c in s.condition : c.values if c.variable == "ec2:CreateAction"])) == toset([
-          "CreateVpc", "CreateSubnet", "CreateInternetGateway", "CreateRouteTable", "CreateSecurityGroup",
-          "AuthorizeSecurityGroupIngress", "AuthorizeSecurityGroupEgress",
-        ])
-      ) if contains(s.actions, "ec2:CreateTags") && anytrue([for c in s.condition : c.variable == "ec2:CreateAction"])
-    ])
-    error_message = "ec2:CreateAction list must match the create actions"
-  }
-}
-
-run "no_broad_allows" {
-  command = plan
-
-  assert {
-    condition = alltrue(flatten([
-      for doc in [
-        data.aws_iam_policy_document.plan,
-        data.aws_iam_policy_document.apply,
-        data.aws_iam_policy_document.deploy,
-        data.aws_iam_policy_document.ecs_boundary,
-      ] : [for s in doc.statement : !contains(s.actions, "*") if s.effect == "Allow"]
-    ]))
-    error_message = "no Allow statement may use Action *"
-  }
-
-  assert {
-    condition = alltrue(flatten([
-      for doc in [
-        data.aws_iam_policy_document.plan,
-        data.aws_iam_policy_document.apply,
-        data.aws_iam_policy_document.deploy,
-        data.aws_iam_policy_document.ecs_boundary,
-        ] : [
-        for s in doc.statement : alltrue([
-          for a in s.actions : contains([
-            "ec2:Describe*",
-            "elasticloadbalancing:Describe*",
-            "logs:DescribeLogGroups",
-            "ecs:DescribeTaskDefinition",
-            "ecs:DeregisterTaskDefinition",
-            "ecr:GetAuthorizationToken",
-          ], a)
-        ]) if s.effect == "Allow" && contains(s.resources, "*")
-      ]
-    ]))
-    error_message = "Allow with Resource * is limited to the B20 list"
-  }
-
-  assert {
-    condition = alltrue(flatten([
-      for doc in [
-        data.aws_iam_policy_document.plan,
-        data.aws_iam_policy_document.apply,
-        data.aws_iam_policy_document.deploy,
-        data.aws_iam_policy_document.ecs_boundary,
-      ] : [for s in doc.statement : alltrue([for a in s.actions : !endswith(a, "*") || endswith(a, ":Describe*")]) if s.effect == "Allow"]
-    ]))
-    error_message = "action wildcards in Allow are limited to Describe*"
-  }
-}
-
-run "boundary_contents" {
-  command = plan
-
-  assert {
-    condition     = aws_iam_policy.ecs_boundary.name == "sis-dev-ecs-boundary"
-    error_message = "boundary policy name"
-  }
-
-  assert {
-    condition = anytrue([
-      for s in data.aws_iam_policy_document.ecs_boundary.statement :
-      contains(s.actions, "secretsmanager:GetSecretValue") && toset(s.resources) == toset(["arn:aws:secretsmanager:ap-southeast-1:123456789012:secret:sis/dev/*"])
-    ])
-    error_message = "boundary may read only sis/dev secrets"
-  }
-}
-
-run "name_contract_output" {
-  command = plan
-
-  assert {
-    condition = (
-      local.resource_names.ecs_cluster == "sis-dev-cluster"
-      && local.resource_names.ecs_service == "sis-dev-app"
-      && local.resource_names.ecr_repository == "sis-dev-app"
-      && local.resource_names.ecs_exec_role == "sis-dev-ecs-exec"
-      && local.resource_names.ecs_task_role == "sis-dev-ecs-task"
-      && local.resource_names.task_family == "sis-dev-app"
-      && local.resource_names.log_group == "/ecs/sis-dev-app"
-      && local.resource_names.alb == "sis-dev-alb"
-      && local.resource_names.target_group == "sis-dev-tg"
-      && local.resource_names.secret == "sis/dev/app-api-key"
-      && local.resource_names.boundary == "sis-dev-ecs-boundary"
-      && length(local.resource_names) == 11
-    )
-    error_message = "name contract"
-  }
-}
-
-run "apply_e3_additions" {
-  command = plan
-
-  assert {
-    condition = length([
-      for s in data.aws_iam_policy_document.apply.statement : s
-      if s.sid == "Ec2ValidateSgQuotasOnTaggedGroup"
-      && s.effect == "Allow"
-      && s.actions == toset(["ec2:ValidateSecurityGroupQuotasForInterface"])
-      && s.resources == toset(["arn:aws:ec2:ap-southeast-1:123456789012:security-group/*"])
-      && anytrue([for c in s.condition : c.test == "StringEquals" && c.variable == "aws:ResourceTag/Project" && toset(c.values) == toset(["ship-it-safely"])])
-      && anytrue([for c in s.condition : c.test == "StringEquals" && c.variable == "aws:ResourceTag/Env" && toset(c.values) == toset(["dev"])])
-    ]) == 1
-    error_message = "Ec2ValidateSgQuotasOnTaggedGroup: one action on security-group/* with ResourceTag Project and Env"
-  }
-
-  assert {
-    condition = length([
-      for s in data.aws_iam_policy_document.apply.statement : s
-      if s.sid == "IamEcsRolesRead"
-      && contains(s.actions, "iam:ListRoleTags")
-      && s.resources == toset(["arn:aws:iam::123456789012:role/sis-dev-ecs-exec", "arn:aws:iam::123456789012:role/sis-dev-ecs-task"])
-    ]) == 1
-    error_message = "iam:ListRoleTags must be in IamEcsRolesRead on the two exact ecs role ARNs"
-  }
-}
-
-run "apply_sgs_for_vpc" {
-  command = plan
-
-  assert {
-    condition = length([
-      for s in data.aws_iam_policy_document.apply.statement : s
-      if s.sid == "Ec2SgsForTaggedVpc"
-      && s.effect == "Allow"
-      && s.actions == toset(["ec2:GetSecurityGroupsForVpc"])
-      && s.resources == toset(["arn:aws:ec2:ap-southeast-1:123456789012:vpc/*"])
-      && anytrue([for c in s.condition : c.test == "StringEquals" && c.variable == "aws:ResourceTag/Project" && toset(c.values) == toset(["ship-it-safely"])])
-      && anytrue([for c in s.condition : c.test == "StringEquals" && c.variable == "aws:ResourceTag/Env" && toset(c.values) == toset(["dev"])])
-    ]) == 1
-    error_message = "Ec2SgsForTaggedVpc: GetSecurityGroupsForVpc on vpc/* with ResourceTag Project and Env"
   }
 }
 
@@ -638,15 +280,487 @@ run "deploy_source_pull_in_promoted_env" {
   }
 }
 
-# ADR 0008 P9: the apply role manages the repository policy of its own repositories only.
-run "apply_repository_policy_scope" {
+# ADR 0012 L9, Finding 9: the apply role passes exactly the execution role, to Lambda only; the deploy role can
+# never pass a role (no Allow, plus an explicit Deny).
+run "pass_role_is_exact" {
+  command = plan
+
+  assert {
+    condition = (
+      length([for s in data.aws_iam_policy_document.apply.statement : s if contains(s.actions, "iam:PassRole")]) == 1
+      && alltrue([
+        for s in data.aws_iam_policy_document.apply.statement : (
+          s.effect == "Allow"
+          && toset(s.actions) == toset(["iam:PassRole"])
+          && toset(s.resources) == toset(["arn:aws:iam::123456789012:role/sis-dev-app-exec"])
+          && length(s.condition) == 1
+          && anytrue([
+            for c in s.condition : c.test == "StringEquals" && c.variable == "iam:PassedToService" && toset(c.values) == toset(["lambda.amazonaws.com"])
+          ])
+        ) if contains(s.actions, "iam:PassRole")
+      ])
+    )
+    error_message = "apply PassRole must be one statement on exactly sis-dev-app-exec with iam:PassedToService = lambda.amazonaws.com"
+  }
+
+  assert {
+    condition     = length([for s in data.aws_iam_policy_document.deploy.statement : s if s.effect == "Allow" && contains(s.actions, "iam:PassRole")]) == 0
+    error_message = "the deploy role must not allow iam:PassRole"
+  }
+
+  assert {
+    condition = [
+      for s in data.aws_iam_policy_document.deploy.statement : [s.effect, toset(s.actions), toset(s.resources)]
+      if s.sid == "DenyPassRole"
+    ] == [["Deny", toset(["iam:PassRole"]), toset(["*"])]]
+    error_message = "the deploy role needs the explicit DenyPassRole statement on every resource"
+  }
+
+  assert {
+    condition = alltrue([
+      for s in data.aws_iam_policy_document.deploy.statement : !anytrue([for a in s.actions : startswith(a, "iam:")])
+      if s.effect == "Allow"
+    ])
+    error_message = "the deploy role has no IAM Allow at all"
+  }
+}
+
+run "deploy_lambda_scope" {
+  command = plan
+
+  assert {
+    condition = [
+      for s in data.aws_iam_policy_document.deploy.statement : [s.effect, toset(s.actions), toset(s.resources)]
+      if s.sid == "LambdaReleaseOneFunction"
+      ] == [[
+        "Allow",
+        toset([
+          "lambda:GetFunction",
+          "lambda:GetFunctionConfiguration",
+          "lambda:UpdateFunctionCode",
+          "lambda:UpdateFunctionConfiguration",
+          "lambda:PublishVersion",
+          "lambda:ListVersionsByFunction",
+          "lambda:GetAlias",
+          "lambda:UpdateAlias",
+          "lambda:InvokeFunction",
+        ]),
+        toset([
+          "arn:aws:lambda:ap-southeast-1:123456789012:function:sis-dev-app",
+          "arn:aws:lambda:ap-southeast-1:123456789012:function:sis-dev-app:*",
+        ]),
+    ]]
+    error_message = "the deploy Lambda statement must be the L9 release actions on the one function and its qualified ARNs"
+  }
+
+  # L8: DeleteFunction only on qualified ARNs, so it prunes versions but can never delete the function.
+  assert {
+    condition = (
+      length([for s in data.aws_iam_policy_document.deploy.statement : s if contains(s.actions, "lambda:DeleteFunction")]) == 1
+      && alltrue([
+        for s in data.aws_iam_policy_document.deploy.statement : (
+          s.effect == "Allow"
+          && toset(s.actions) == toset(["lambda:DeleteFunction"])
+          && toset(s.resources) == toset(["arn:aws:lambda:ap-southeast-1:123456789012:function:sis-dev-app:*"])
+        ) if contains(s.actions, "lambda:DeleteFunction")
+      ])
+    )
+    error_message = "deploy lambda:DeleteFunction must be alone in its statement, on the qualified function ARN only"
+  }
+
+  assert {
+    condition = alltrue(flatten([
+      for s in data.aws_iam_policy_document.deploy.statement : [
+        for r in s.resources : r == "*" || !startswith(r, "arn:aws:lambda:") || startswith(r, "arn:aws:lambda:ap-southeast-1:123456789012:function:sis-dev-app")
+      ]
+    ]))
+    error_message = "every deploy Lambda resource must be the one function sis-dev-app"
+  }
+
+  assert {
+    condition = alltrue([
+      for s in data.aws_iam_policy_document.deploy.statement : !anytrue([
+        for a in s.actions : contains(["lambda:CreateFunction", "lambda:CreateAlias", "lambda:DeleteAlias", "lambda:AddPermission", "lambda:RemovePermission", "lambda:PutFunctionConcurrency"], a)
+      ])
+    ])
+    error_message = "the deploy must not create functions or aliases, change permissions or concurrency"
+  }
+
+  assert {
+    condition = [
+      for s in data.aws_iam_policy_document.deploy.statement : [toset(s.actions), toset(s.resources)]
+      if s.sid == "ApiGatewayRead"
+      ] == [[
+        toset(["apigateway:GET"]),
+        toset(["arn:aws:apigateway:ap-southeast-1::/apis", "arn:aws:apigateway:ap-southeast-1::/apis/*"]),
+    ]]
+    error_message = "the deploy may only GET HTTP APIs of its region"
+  }
+
+  assert {
+    condition = [
+      for s in data.aws_iam_policy_document.deploy.statement : [toset(s.actions), toset(s.resources)]
+      if s.sid == "CanaryMetrics"
+    ] == [[toset(["cloudwatch:GetMetricStatistics"]), toset(["*"])]]
+    error_message = "the canary judgment reads metrics with GetMetricStatistics only"
+  }
+
+  assert {
+    condition = alltrue([
+      for s in data.aws_iam_policy_document.deploy.statement : !anytrue([for a in s.actions : startswith(a, "ecs:") || startswith(a, "ec2:") || startswith(a, "elasticloadbalancing:")])
+    ])
+    error_message = "the deploy has no ECS, EC2 or ELB action left (ADR 0012 L11)"
+  }
+}
+
+# L2 (review): AddPermission only for API Gateway (lambda:Principal), in its own statement, so the apply role can
+# never grant invoke to another account, another service or the public.
+run "apply_add_permission_is_api_gateway_only" {
+  command = plan
+
+  assert {
+    condition = [
+      for s in data.aws_iam_policy_document.apply.statement : [
+        s.sid,
+        s.effect,
+        toset(s.actions),
+        toset(s.resources),
+        [for c in s.condition : [c.test, c.variable, toset(c.values)]],
+      ] if contains(s.actions, "lambda:AddPermission")
+      ] == [[
+        "LambdaAddPermissionApiGateway",
+        "Allow",
+        toset(["lambda:AddPermission"]),
+        toset([
+          "arn:aws:lambda:ap-southeast-1:123456789012:function:sis-dev-*",
+          "arn:aws:lambda:ap-southeast-1:123456789012:function:sis-dev-*:*",
+        ]),
+        [["StringEquals", "lambda:Principal", toset(["apigateway.amazonaws.com"])]],
+    ]]
+    error_message = "lambda:AddPermission must be alone in one statement with StringEquals lambda:Principal = apigateway.amazonaws.com"
+  }
+
+  # B2: the provider may read the recursion config on refresh; read only, on this env's functions.
+  assert {
+    condition = contains(flatten([
+      for s in data.aws_iam_policy_document.apply.statement : tolist(s.actions) if s.sid == "LambdaFunction"
+    ]), "lambda:GetFunctionRecursionConfig")
+    error_message = "the apply role may read the function recursion config"
+  }
+}
+
+run "apply_lambda_and_front_door_scope" {
   command = plan
 
   assert {
     condition = alltrue([
-      for s in data.aws_iam_policy_document.apply.statement : toset(s.resources) == toset(["arn:aws:ecr:ap-southeast-1:123456789012:repository/sis-dev-*"])
-      if contains(s.actions, "ecr:SetRepositoryPolicy") || contains(s.actions, "ecr:DeleteRepositoryPolicy")
+      for s in data.aws_iam_policy_document.apply.statement : toset(s.resources) == toset([
+        "arn:aws:lambda:ap-southeast-1:123456789012:function:sis-dev-*",
+        "arn:aws:lambda:ap-southeast-1:123456789012:function:sis-dev-*:*",
+      ]) if anytrue([for a in s.actions : startswith(a, "lambda:")])
     ])
-    error_message = "repository policy writes must be scoped to this env's repositories"
+    error_message = "apply Lambda actions must be scoped to this env's functions and their qualified ARNs"
+  }
+
+  assert {
+    condition = alltrue([
+      for a in [
+        "lambda:CreateFunction", "lambda:DeleteFunction", "lambda:GetFunction", "lambda:UpdateFunctionConfiguration",
+        "lambda:PublishVersion", "lambda:CreateAlias", "lambda:UpdateAlias",
+        "lambda:RemovePermission", "lambda:GetFunctionRecursionConfig", "lambda:GetPolicy", "lambda:PutFunctionConcurrency", "lambda:DeleteFunctionConcurrency",
+        "lambda:TagResource", "lambda:ListTags",
+      ] : contains(flatten([for s in data.aws_iam_policy_document.apply.statement : tolist(s.actions) if s.sid == "LambdaFunction"]), a)
+    ])
+    error_message = "the apply role must manage the function, alias, permission, concurrency and tags"
+  }
+
+  assert {
+    condition = alltrue([
+      for s in data.aws_iam_policy_document.apply.statement : toset(s.resources) == toset([
+        "arn:aws:apigateway:ap-southeast-1::/apis",
+        "arn:aws:apigateway:ap-southeast-1::/apis/*",
+        "arn:aws:apigateway:ap-southeast-1::/tags/*",
+      ]) if anytrue([for a in s.actions : startswith(a, "apigateway:")])
+    ])
+    error_message = "apply API Gateway actions must be scoped to /apis, /apis/* and /tags/* of the region"
+  }
+
+  assert {
+    condition = alltrue([
+      for s in data.aws_iam_policy_document.apply.statement : toset(s.resources) == toset([
+        "arn:aws:logs:ap-southeast-1:123456789012:log-group:/aws/lambda/sis-dev-*",
+        "arn:aws:logs:ap-southeast-1:123456789012:log-group:/aws/lambda/sis-dev-*:*",
+        "arn:aws:logs:ap-southeast-1:123456789012:log-group:/aws/apigateway/sis-dev-*",
+        "arn:aws:logs:ap-southeast-1:123456789012:log-group:/aws/apigateway/sis-dev-*:*",
+      ]) if contains(s.actions, "logs:CreateLogGroup")
+    ])
+    error_message = "log group writes must be scoped to the two log group patterns of this env"
+  }
+
+  assert {
+    condition = alltrue([
+      for s in data.aws_iam_policy_document.apply.statement : toset(s.resources) == toset(["arn:aws:cloudwatch:ap-southeast-1:123456789012:alarm:sis-dev-*"])
+      if anytrue([for a in s.actions : startswith(a, "cloudwatch:")])
+    ])
+    error_message = "alarm actions must be scoped to this env's alarms"
+  }
+
+  assert {
+    condition = alltrue([
+      for s in data.aws_iam_policy_document.apply.statement : (
+        toset(s.resources) == toset(["arn:aws:iam::123456789012:role/aws-service-role/ops.apigateway.amazonaws.com/*"])
+        && anytrue([for c in s.condition : c.test == "StringEquals" && c.variable == "iam:AWSServiceName" && toset(c.values) == toset(["ops.apigateway.amazonaws.com"])])
+      ) if contains(s.actions, "iam:CreateServiceLinkedRole")
+    ])
+    error_message = "the only service-linked role is API Gateway's"
+  }
+}
+
+# ADR 0012 L4: the repository and its policy are bootstrap's. The apply role reads the one repository only: the
+# data source, plus what CreateFunction and UpdateFunctionCode with an image need on the caller (B2).
+run "apply_ecr_read_only" {
+  command = plan
+
+  assert {
+    condition = [
+      for s in data.aws_iam_policy_document.apply.statement : [toset(s.actions), toset(s.resources)]
+      if anytrue([for a in s.actions : startswith(a, "ecr:")])
+      ] == [[
+        toset([
+          "ecr:DescribeImages",
+          "ecr:DescribeRepositories",
+          "ecr:BatchGetImage",
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:GetRepositoryPolicy",
+        ]),
+        toset(["arn:aws:ecr:ap-southeast-1:123456789012:repository/sis-dev-app"]),
+    ]]
+    error_message = "the apply role may only read the one repository (no create, delete, push or policy write)"
+  }
+
+  assert {
+    condition = alltrue([
+      for doc in [data.aws_iam_policy_document.plan, data.aws_iam_policy_document.apply, data.aws_iam_policy_document.deploy] :
+      alltrue([for s in doc.statement : !contains(s.actions, "ecr:SetRepositoryPolicy") if s.effect == "Allow"])
+    ])
+    error_message = "no CI role may set a repository policy, so Lambda can never widen it (L4)"
+  }
+
+  assert {
+    condition = alltrue([
+      for s in data.aws_iam_policy_document.apply.statement : !anytrue([for a in s.actions : startswith(a, "ecs:") || startswith(a, "ec2:") || startswith(a, "elasticloadbalancing:")])
+    ])
+    error_message = "the apply role has no ECS, EC2 or ELB action left (ADR 0012 L11)"
+  }
+}
+
+run "apply_iam_requires_boundary" {
+  command = plan
+
+  assert {
+    condition = alltrue([
+      for s in data.aws_iam_policy_document.apply.statement : anytrue([
+        for c in s.condition : c.test == "StringEquals" && c.variable == "iam:PermissionsBoundary" && toset(c.values) == toset(["arn:aws:iam::123456789012:policy/sis-dev-app-boundary"])
+      ]) if contains(s.actions, "iam:CreateRole")
+    ])
+    error_message = "iam:CreateRole needs the boundary condition"
+  }
+
+  # Per the IAM Service Authorization Reference these four support iam:PermissionsBoundary.
+  assert {
+    condition = alltrue([
+      for a in ["iam:CreateRole", "iam:PutRolePolicy", "iam:DeleteRolePolicy", "iam:PutRolePermissionsBoundary"] :
+      anytrue([
+        for s in data.aws_iam_policy_document.apply.statement : (
+          contains(s.actions, a)
+          && toset(s.resources) == toset(["arn:aws:iam::123456789012:role/sis-dev-app-exec"])
+          && anytrue([for c in s.condition : c.variable == "iam:PermissionsBoundary"])
+        ) if s.effect == "Allow"
+      ])
+    ])
+    error_message = "every mutating IAM role action must sit under the boundary condition on exactly the execution role ARN"
+  }
+
+  # L3 (review): the condition only sits on actions that support the key. On any other action it would not
+  # constrain anything; it would only deny the action (the key is absent from the request).
+  assert {
+    condition = alltrue(flatten([
+      for s in data.aws_iam_policy_document.apply.statement : [
+        for a in s.actions : contains([
+          "iam:CreateRole",
+          "iam:PutRolePolicy",
+          "iam:DeleteRolePolicy",
+          "iam:PutRolePermissionsBoundary",
+          "iam:AttachRolePolicy",
+          "iam:DetachRolePolicy",
+          "iam:DeleteRolePermissionsBoundary",
+        ], a)
+      ] if s.effect == "Allow" && anytrue([for c in s.condition : c.variable == "iam:PermissionsBoundary"])
+    ]))
+    error_message = "iam:PermissionsBoundary conditions may only sit on actions that support the key"
+  }
+
+  # Trust change and delete (no iam:PermissionsBoundary support) and the metadata writes: exact role ARN, no
+  # condition, and the metadata statement never claims to be a read.
+  assert {
+    condition = {
+      for s in data.aws_iam_policy_document.apply.statement : s.sid => [
+        s.effect, toset(s.actions), toset(s.resources), length(s.condition)
+      ] if contains(["IamAppRoleTrustAndDelete", "IamAppRoleMetadata", "IamAppRoleRead"], s.sid)
+      } == {
+      IamAppRoleTrustAndDelete = ["Allow", toset(["iam:UpdateAssumeRolePolicy", "iam:DeleteRole"]), toset(["arn:aws:iam::123456789012:role/sis-dev-app-exec"]), 0]
+      IamAppRoleMetadata       = ["Allow", toset(["iam:TagRole", "iam:UntagRole", "iam:UpdateRole", "iam:UpdateRoleDescription"]), toset(["arn:aws:iam::123456789012:role/sis-dev-app-exec"]), 0]
+      IamAppRoleRead = ["Allow", toset([
+        "iam:GetRole",
+        "iam:GetRolePolicy",
+        "iam:ListRolePolicies",
+        "iam:ListAttachedRolePolicies",
+        "iam:ListInstanceProfilesForRole",
+        "iam:ListRoleTags",
+      ]), toset(["arn:aws:iam::123456789012:role/sis-dev-app-exec"]), 0]
+    }
+    error_message = "trust/delete, metadata and read statements: exact execution role ARN, no condition, reads only in IamAppRoleRead"
+  }
+
+  # No IAM write or read on roles may target a wildcard role pattern (M1).
+  assert {
+    condition = alltrue([
+      for s in data.aws_iam_policy_document.apply.statement : alltrue([for r in s.resources : !strcontains(r, "role/") || !strcontains(r, "*") || strcontains(r, "role/aws-service-role/")])
+      if s.effect == "Allow" && anytrue([for a in s.actions : startswith(a, "iam:") && a != "iam:CreateServiceLinkedRole"])
+    ])
+    error_message = "no IAM action may target a wildcard role pattern (service-linked roles excepted)"
+  }
+
+  assert {
+    condition = alltrue([
+      for s in data.aws_iam_policy_document.apply.statement : toset(s.resources) == toset(["arn:aws:iam::123456789012:role/sis-dev-app-exec"])
+      if contains(["IamAppRoleBounded", "IamAppRoleTrustAndDelete", "IamAppRoleMetadata", "IamAppRoleRead", "PassAppExecRole"], s.sid)
+    ])
+    error_message = "app role statements must target exactly sis-dev-app-exec"
+  }
+
+  assert {
+    condition = anytrue([
+      for s in data.aws_iam_policy_document.apply.statement : s.effect == "Deny" && contains(s.actions, "iam:DeleteRolePermissionsBoundary")
+    ])
+    error_message = "apply must deny removing the boundary"
+  }
+
+  assert {
+    condition = alltrue([
+      for s in data.aws_iam_policy_document.apply.statement : !anytrue([for a in s.actions : startswith(a, "iam:Attach")])
+    ])
+    error_message = "apply must not attach managed policies"
+  }
+}
+
+run "no_broad_allows" {
+  command = plan
+
+  assert {
+    condition = alltrue(flatten([
+      for doc in [
+        data.aws_iam_policy_document.plan,
+        data.aws_iam_policy_document.apply,
+        data.aws_iam_policy_document.deploy,
+        data.aws_iam_policy_document.app_boundary,
+      ] : [for s in doc.statement : !contains(s.actions, "*") if s.effect == "Allow"]
+    ]))
+    error_message = "no Allow statement may use Action *"
+  }
+
+  # The B20 list as rewritten by ADR 0012 L9: each API below has no resource-level support.
+  assert {
+    condition = alltrue(flatten([
+      for doc in [
+        data.aws_iam_policy_document.plan,
+        data.aws_iam_policy_document.apply,
+        data.aws_iam_policy_document.deploy,
+        data.aws_iam_policy_document.app_boundary,
+        ] : [
+        for s in doc.statement : alltrue([
+          for a in s.actions : contains([
+            "ecr:GetAuthorizationToken",
+            "cloudwatch:GetMetricStatistics",
+            "logs:DescribeLogGroups",
+            "logs:CreateLogDelivery",
+            "logs:GetLogDelivery",
+            "logs:UpdateLogDelivery",
+            "logs:DeleteLogDelivery",
+            "logs:ListLogDeliveries",
+            "logs:PutResourcePolicy",
+            "logs:DescribeResourcePolicies",
+          ], a)
+        ]) if s.effect == "Allow" && contains(s.resources, "*")
+      ]
+    ]))
+    error_message = "Allow with Resource * is limited to the B20 list (ADR 0012 L9)"
+  }
+
+  assert {
+    condition = alltrue(flatten([
+      for doc in [
+        data.aws_iam_policy_document.plan,
+        data.aws_iam_policy_document.apply,
+        data.aws_iam_policy_document.deploy,
+        data.aws_iam_policy_document.app_boundary,
+      ] : [for s in doc.statement : alltrue([for a in s.actions : !strcontains(a, "*")]) if s.effect == "Allow"]
+    ]))
+    error_message = "no action wildcard in any Allow"
+  }
+}
+
+run "boundary_contents" {
+  command = plan
+
+  assert {
+    condition     = aws_iam_policy.app_boundary.name == "sis-dev-app-boundary"
+    error_message = "boundary policy name"
+  }
+
+  assert {
+    condition = {
+      for s in data.aws_iam_policy_document.app_boundary.statement : s.sid => [s.effect, toset(s.actions), toset(s.resources)]
+      } == {
+      LambdaLogsWrite = ["Allow", toset(["logs:CreateLogStream", "logs:PutLogEvents"]), toset([
+        "arn:aws:logs:ap-southeast-1:123456789012:log-group:/aws/lambda/sis-dev-*",
+        "arn:aws:logs:ap-southeast-1:123456789012:log-group:/aws/lambda/sis-dev-*:*",
+      ])]
+      AppSecretRead = ["Allow", toset(["secretsmanager:GetSecretValue"]), toset(["arn:aws:secretsmanager:ap-southeast-1:123456789012:secret:sis/dev/*"])]
+    }
+    error_message = "the boundary allows only log writes to /aws/lambda/sis-dev-* and reading sis/dev secrets"
+  }
+
+  # M3a (review): the secret read only works from inside the env's function (unqualified ARN, ArnEquals), so a role
+  # given a foreign trust still cannot read it. The log statement has no condition.
+  assert {
+    condition = {
+      for s in data.aws_iam_policy_document.app_boundary.statement : s.sid => [
+        for c in s.condition : [c.test, c.variable, toset(c.values)]
+      ]
+      } == {
+      LambdaLogsWrite = []
+      AppSecretRead   = [["ArnEquals", "lambda:SourceFunctionArn", toset(["arn:aws:lambda:ap-southeast-1:123456789012:function:sis-dev-app"])]]
+    }
+    error_message = "AppSecretRead needs ArnEquals lambda:SourceFunctionArn = the unqualified function ARN"
+  }
+}
+
+run "name_contract_output" {
+  command = plan
+
+  assert {
+    condition = local.resource_names == {
+      function         = "sis-dev-app"
+      alias            = "live"
+      api              = "sis-dev-api"
+      app_exec_role    = "sis-dev-app-exec"
+      boundary         = "sis-dev-app-boundary"
+      ecr_repository   = "sis-dev-app"
+      lambda_log_group = "/aws/lambda/sis-dev-app"
+      api_log_group    = "/aws/apigateway/sis-dev-api"
+      secret           = "sis/dev/app-api-key"
+    }
+    error_message = "name contract (ADR 0012 L3, L4)"
   }
 }

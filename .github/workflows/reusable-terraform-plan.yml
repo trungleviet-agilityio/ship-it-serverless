@@ -22,12 +22,6 @@ on:
       AWS_PLAN_ROLE_ARN:
         description: ARN of the read-only plan role
         required: true
-      ALB_INGRESS_CIDRS:
-        description: Optional JSON list of CIDRs allowed to reach the ALB
-        required: false
-      PROMOTION_TARGET_ACCOUNT_ID:
-        description: Account of the env's promotion target (ADR 0008 P9); required by the plan when terraform.tfvars sets promotion_target_env
-        required: false
 
 permissions: {}
 
@@ -67,10 +61,11 @@ jobs:
             releases.hashicorp.com:443
             registry.terraform.io:443
             sts.${{ vars.AWS_REGION }}.amazonaws.com:443
-            sis-${{ env.ENV }}-tfstate-${{ secrets.AWS_ACCOUNT_ID }}-${{ vars.AWS_REGION }}-an.s3.${{ vars.AWS_REGION }}.amazonaws.com:443
-            ec2.${{ vars.AWS_REGION }}.amazonaws.com:443
-            elasticloadbalancing.${{ vars.AWS_REGION }}.amazonaws.com:443
-            ecs.${{ vars.AWS_REGION }}.amazonaws.com:443
+            sls-${{ env.ENV }}-tfstate-${{ secrets.AWS_ACCOUNT_ID }}-${{ vars.AWS_REGION }}-an.s3.${{ vars.AWS_REGION }}.amazonaws.com:443
+            lambda.${{ vars.AWS_REGION }}.amazonaws.com:443
+            apigateway.${{ vars.AWS_REGION }}.amazonaws.com:443
+            monitoring.${{ vars.AWS_REGION }}.amazonaws.com:443
+            sns.${{ vars.AWS_REGION }}.amazonaws.com:443
             api.ecr.${{ vars.AWS_REGION }}.amazonaws.com:443
             logs.${{ vars.AWS_REGION }}.amazonaws.com:443
             secretsmanager.${{ vars.AWS_REGION }}.amazonaws.com:443
@@ -81,8 +76,8 @@ jobs:
         with:
           persist-credentials: false
 
-      # Select the root, install the tools, check the config, assume the plan role, init and mask the CIDRs (shared with
-      # the apply and destroy jobs). A local action: it needs the checkout above.
+      # Select the root, install the tools, check the config, assume the plan role and init (shared with the apply and
+      # destroy jobs). A local action: it needs the checkout above.
       - name: Set up Terraform with the plan role
         uses: ./.github/actions/terraform-setup # zizmor: ignore[self-repository]
         with:
@@ -92,13 +87,10 @@ jobs:
           account-id: ${{ secrets.AWS_ACCOUNT_ID }}
           region: ${{ vars.AWS_REGION }}
           session-prefix: plan
-          alb-ingress-cidrs: ${{ secrets.ALB_INGRESS_CIDRS }}
 
       - name: Terraform plan
         env:
           TF_VAR_aws_account_id: ${{ secrets.AWS_ACCOUNT_ID }}
-          TF_VAR_alb_ingress_cidrs_json: ${{ secrets.ALB_INGRESS_CIDRS }}
-          TF_VAR_promotion_target_account_id: ${{ secrets.PROMOTION_TARGET_ACCOUNT_ID }}
         run: terraform -chdir="$TF_DIR" plan -lock-timeout=5m -no-color -out=tfplan
 
       # Counts and one row per changed address; fails if a 12-digit run shows up (the repo is public).

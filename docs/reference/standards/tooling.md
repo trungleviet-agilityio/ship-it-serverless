@@ -20,7 +20,7 @@ Tool versions, the `Makefile` and `scripts/`. Part of the [standards index](READ
   (ADR 0001, D15).
 - Targets must work with the GNU Make 3.81 that ships with macOS (no `.ONESHELL`, no
   `.SHELLFLAGS`).
-- Scripts live in one folder per domain: `tf/`, `image/`, `ecs/`, `aws/`, `guard/` (workflow policy checks)
+- Scripts live in one folder per domain: `tf/`, `image/`, `lambda/`, `aws/`, `guard/` (workflow policy checks)
   and `ci/` (tool install, venv, self-test runner). Names drop the domain prefix (`scripts/tf/init.sh`).
   `scripts/lib.sh` holds shared functions; `scripts/names.sh <image|app|env-root|gha-role|role>` prints
   derived names; a one-line wrapper around a `lib.sh` function belongs in `names.sh`, not in a new file.

@@ -1,6 +1,7 @@
 # Version updates (NFR-5, ADR 0007 S5). One monthly PR per ecosystem, with a cooldown so a bad release can be pulled
 # before it is proposed (security updates ignore the cooldown). Commit titles read `<prefix>(deps): ...`.
-# Not covered, so they get a monthly manual check (PROGRESS): the tool versions in mise.toml with
+# Not covered, so they get a monthly manual check (PROGRESS): the two image digests in app/Dockerfile, the tool
+# versions in mise.toml with
 # scripts/ci/tools.sha256, and scripts/ci/requirements.txt (a uv-compiled, hash-locked file; no `pip` entry on purpose).
 # Terraform PRs from the bot get no plan (no secrets for Dependabot). Re-open one from a maintainer branch before
 # merging it, so the plan role runs.
@@ -23,25 +24,11 @@ updates:
       actions:
         patterns: ["*"]
 
-  # The one `FROM ... AS base` line in app/Dockerfile (image/build.sh swaps its registry with a build context).
-  # Python stays on 3.13: only digest and patch updates arrive (ADR 0007 S46).
-  - package-ecosystem: docker
-    directory: /app
-    schedule:
-      interval: monthly
-    cooldown:
-      default-days: 7
-    commit-message:
-      prefix: build
-      include: scope
-    groups:
-      base-image:
-        patterns: ["*"]
-    ignore:
-      - dependency-name: docker/library/python
-        update-types:
-          - version-update:semver-minor
-          - version-update:semver-major
+  # No `docker` entry (ADR 0012, docs/tradeoffs.md section 17): both images in app/Dockerfile live on public.ecr.aws
+  # (the Python base and the Lambda Web Adapter), and Dependabot's registry proxy cannot authenticate to ECR Public
+  # (runs failed with "DENIED: Not Authorized"; upstream https://github.com/dependabot/proxy/issues/157). Bump both
+  # digests by hand once a month with the pin-versions skill; App CI rebuilds and Trivy-scans every bump. Re-add the
+  # entry when the upstream issue is fixed.
 
   # Provider and lock file updates. The globs pick up envs/prod in Phase 7.
   - package-ecosystem: terraform
