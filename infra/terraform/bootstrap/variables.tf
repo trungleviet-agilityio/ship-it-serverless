@@ -149,3 +149,26 @@ variable "promotion_source_env" {
     error_message = "promotion_source_env must be 2 to 8 lowercase letters and digits, starting with a letter (ADR 0008, P4)."
   }
 }
+
+variable "promotion_target_account_id" {
+  type        = string
+  description = "Account of the environment that promotes images from this one (ADR 0008 P9, ADR 0012 L4), e.g. the prod account in dev. Null: the repository policy has no PromotionPull statement. Sensitive, so it never prints in a plan."
+  default     = null
+  sensitive   = true
+
+  validation {
+    condition     = var.promotion_target_account_id == null || can(regex("^[0-9]{12}$", var.promotion_target_account_id))
+    error_message = "promotion_target_account_id must be null or exactly 12 digits."
+  }
+}
+
+variable "promotion_target_env" {
+  type        = string
+  description = "Environment name of the promotion target; PromotionPull names its deploy role <prefix>-<env>-gha-deploy. Used only when promotion_target_account_id is set."
+  default     = "prod"
+
+  validation {
+    condition     = can(regex("^[a-z][a-z0-9]{1,7}$", var.promotion_target_env))
+    error_message = "promotion_target_env must be 2 to 8 lowercase letters and digits, starting with a letter (ADR 0008, P4)."
+  }
+}

@@ -205,13 +205,15 @@ env_root() {
   printf 'infra/terraform/envs/%s' "$1"
 }
 
-# app_names: derive the resource names of one environment from ENV (default dev; ADR 0001, naming).
+# app_names: derive the resource names of one environment from ENV (default dev; ADR 0001, naming; ADR 0012 L3, L4).
+# FUNCTION, ALIAS and API are the Lambda function, its serving alias and the HTTP API (Terraform); REPOSITORY is the ECR
+# repository (bootstrap); SECRET_ID is the app secret (shell only, Terraform). The log groups are named for messages.
 app_names() {
   require_env
   local p="${PROJECT_PREFIX}-${ENV}"
-  CLUSTER="${p}-cluster" SERVICE="${p}-app" FAMILY="${p}-app" REPOSITORY="${p}-app"
-  EXEC_ROLE="${p}-ecs-exec" TASK_ROLE="${p}-ecs-task"
-  SECRET_ID="${PROJECT_PREFIX}/${ENV}/app-api-key" LOG_GROUP="/ecs/${p}-app"
+  FUNCTION="${p}-app" ALIAS="live" API="${p}-api" REPOSITORY="${p}-app"
+  SECRET_ID="${PROJECT_PREFIX}/${ENV}/app-api-key"
+  FUNCTION_LOG_GROUP="/aws/lambda/${p}-app" API_LOG_GROUP="/aws/apigateway/${p}-api"
 }
 
 # gha_role_name <plan|apply|deploy>: the name of a GitHub Actions role of ENV (default dev; bootstrap iam_*.tf).
@@ -224,25 +226,6 @@ gha_role_name() {
 # state_bucket <env> <account> <region>: the Terraform state bucket of an environment (ADR 0002, B8). It holds the
 # account ID, so callers never print it.
 state_bucket() { printf '%s-%s-tfstate-%s-%s-an' "$PROJECT_PREFIX" "$1" "$2" "$3"; }
-
-# ecs_service_status <cluster> <service>: set SERVICE_STATUS to ACTIVE, DRAINING, INACTIVE or MISSING. MISSING covers
-# no cluster and the answers "None", "MISSING" and empty. Any other error or status dies with redacted text, so a
-# new or unexpected answer never reads as "the service is gone".
-ecs_service_status() {
-  SERVICE_STATUS=""
-  run_capture aws ecs describe-services --cluster "$1" --services "$2" --query 'services[0].status' --output text
-  if [ "$RUN_RC" -ne 0 ]; then
-    case "$RUN_ERR" in
-      *ClusterNotFoundException*) SERVICE_STATUS=MISSING; return 0 ;;
-      *) die "describe-services failed (exit code $RUN_RC): $RUN_ERR" ;;
-    esac
-  fi
-  case "$RUN_OUT" in
-    None | MISSING | "") SERVICE_STATUS=MISSING ;;
-    ACTIVE | DRAINING | INACTIVE) SERVICE_STATUS="$RUN_OUT" ;;
-    *) die "describe-services returned an unexpected status: $(printf '%s' "$RUN_OUT" | redact_ids)" ;;
-  esac
-}
 
 # assumed_role_name: print the name of the role the current AWS credentials assumed, never the session name (it
 # carries the run ID). Returns 1 when the caller is not an assumed role. Summaries use it because
@@ -258,13 +241,15 @@ assumed_role_name() {
   esac
 }
 
-# Seconds the rollout wait allows before it gives up.
-DEFAULT_WAIT_TIMEOUT=1200
+# --- Lambda deploy contract (ADR 0012 L6 to L8), shared by scripts/lambda/*.sh and their self-tests.
 
-# Task-level caps the deploy role allows (ecs:task-cpu and ecs:task-memory conditions in
-# infra/terraform/bootstrap/iam_deploy.tf). Keep them equal to that file.
-TASK_CPU_MAX=512
-TASK_MEMORY_MAX=1024
+# The description PublishVersion gets: it ties a version to one commit and one image digest, so a rollback can find the
+# version again (lambda_version_description <sha> <digest>).
+lambda_version_description() { printf 'sha=%s digest=%s' "$1" "$2"; }
 
-# Keys of RegisterTaskDefinition (ADR 0005, Finding 6). Shared by render-task-def.sh and its self-test.
-REQUEST_KEYS_JSON='["containerDefinitions","cpu","enableFaultInjection","ephemeralStorage","executionRoleArn","family","inferenceAccelerators","ipcMode","memory","networkMode","pidMode","placementConstraints","proxyConfiguration","requiresCompatibilities","runtimePlatform","tags","taskRoleArn","volumes"]'
+# Published versions the deploy keeps (ADR 0012 L8): ECR keeps 20 images, so no kept version points at a deleted one.
+DEFAULT_KEEP_VERSIONS=10
+
+# valid_sha <value> / valid_digest <value>: a full commit SHA (40 hex) and an image digest (sha256:<64 hex>).
+valid_sha() { [[ "$1" =~ ^[0-9a-f]{40}$ ]]; }
+valid_digest() { [[ "$1" =~ ^sha256:[0-9a-f]{64}$ ]]; }

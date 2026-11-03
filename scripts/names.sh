@@ -31,7 +31,7 @@ case "$kind" in
   app)
     [ $# -eq 0 ] || die "usage: ENV=dev scripts/names.sh app"
     app_names
-    printf '%s=%s\n' CLUSTER "$CLUSTER" SERVICE "$SERVICE" FAMILY "$FAMILY" REPOSITORY "$REPOSITORY"
+    printf '%s=%s\n' FUNCTION "$FUNCTION" ALIAS "$ALIAS" API "$API" REPOSITORY "$REPOSITORY" SECRET_ID "$SECRET_ID"
     ;;
   env-root)
     [ $# -eq 0 ] || die "usage: ENV=dev scripts/names.sh env-root"

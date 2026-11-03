@@ -31,7 +31,7 @@ test: ## App unit tests
 image: ## Build the app image the way CI does (single platform, tests run inside)
 	scripts/image/build.sh $(FULL_SHA) $(IMAGE)
 
-smoke: ## Run the built image like Fargate and check it (run make image first)
+smoke: ## Run the built image like Lambda/compose and check it (run make image first)
 	scripts/image/smoke.sh $(IMAGE) $(FULL_SHA)
 
 scan: ## Scan the built image with trivy; fixable HIGH or CRITICAL fails (run make image first)
@@ -65,10 +65,10 @@ docs: ## Regenerate terraform-docs tables in every Terraform README
 	pre-commit run terraform_docs --all-files
 
 # ENV must come from the command line: make imports the shell environment, and an exported ENV must not pick the name.
-new-env: ## Clone an environment: make new-env ENV=qa [FROM=dev] [CIDR=10.N.0.0/16] [DRY_RUN=1]
+new-env: ## Clone an environment: make new-env ENV=qa [FROM=dev] [DRY_RUN=1]
 	@$(if $(filter command line,$(origin STRATEGY)),echo "STRATEGY was removed by ADR 0008 amendment S" >&2; exit 2,:)
-	@$(if $(filter command line,$(origin ENV)),:,echo "usage: make new-env ENV=<name> [FROM=dev] [CIDR=...] [DRY_RUN=1]" >&2; exit 2)
-	scripts/tf/new-env.sh "$(ENV)" $(if $(FROM),--from "$(FROM)") $(if $(CIDR),--cidr "$(CIDR)") $(if $(DRY_RUN),--dry-run)
+	@$(if $(filter command line,$(origin ENV)),:,echo "usage: make new-env ENV=<name> [FROM=dev] [DRY_RUN=1]" >&2; exit 2)
+	scripts/tf/new-env.sh "$(ENV)" $(if $(FROM),--from "$(FROM)") $(if $(DRY_RUN),--dry-run)
 
 # Like ENV above, PREFIX must come from the command line.
 set-prefix: ## Rename the project for a fork, before its first bootstrap: make set-prefix PREFIX=acme
