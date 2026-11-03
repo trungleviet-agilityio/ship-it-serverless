@@ -107,13 +107,29 @@ There is no `apply` or `destroy` target (ADR 0001 D15).
 
 ## Repo configuration the pipelines read
 
-| Where | Name | Kind |
-|---|---|---|
-| Repo | `AWS_PLAN_ROLE_ARN_<ENV>`, `AWS_ACCOUNT_ID_<ENV>` | secrets for the PR plan (no environment) |
-| Repo | `AWS_REGION` = `ap-southeast-1` | variable |
-| Environment `<env>` | `AWS_ACCOUNT_ID`, `AWS_APPLY_ROLE_ARN`, `AWS_DEPLOY_ROLE_ARN` | secrets, same names in every environment |
-| Environment `dev`, `prod` | required reviewer (you), deployment branches `main` only | protection rules |
-| Repo | ruleset on `main`: PR required, no force push, status check `guard` required | ruleset |
+Every secret and variable the workflows read (`grep -rhoE 'secrets\.[A-Z_]+|vars\.[A-Z_]+' .github`). Until the
+accounts are bootstrapped and these are set, the credentialed jobs (Terraform plan, OIDC Smoke Test, apply, App
+Deploy) fail early with "The role ARN secret or the account ID secret is empty or not set": that is expected.
+
+| Where | Name | Kind | Read by |
+|---|---|---|---|
+| Repo | `AWS_REGION` = `ap-southeast-1` | variable | every AWS job |
+| Repo | `AWS_PLAN_ROLE_ARN_DEV`, `AWS_ACCOUNT_ID_DEV` | secrets (hold the account ID) | PR plan for dev, OIDC Smoke Test, App Promote (`AWS_ACCOUNT_ID_DEV`: the source registry) |
+| Repo | `AWS_PLAN_ROLE_ARN_PROD`, `AWS_ACCOUNT_ID_PROD` | secrets | PR plan for prod, OIDC Smoke Test (negative tests across accounts) |
+| Environment `dev` and `prod` | `AWS_ACCOUNT_ID`, `AWS_APPLY_ROLE_ARN`, `AWS_DEPLOY_ROLE_ARN` | secrets, same names in both environments | apply, destroy, App Deploy, App Promote |
+| Environment `dev` and `prod` (optional) | `RELEASE_STRATEGY` (`all-at-once` or `canary`), `CANARY_PERCENT` (1 to 50), `BAKE_MINUTES` (1 to 30) | variables | push deploys (a manual dispatch uses its own inputs) |
+| Environment `dev`, `prod` | required reviewer (you), deployment branches `main` only | protection rules | every environment job |
+| Repo | ruleset on `main`: PR required, no force push, status check `guard` required | ruleset | merges |
+
+`AWS_PLAN_ROLE_ARN` (no suffix) is not a secret you set: `terraform-iac.yml` maps the suffixed secret to that name
+when it calls the reusable plan.
+
+### Dependabot
+
+One monthly PR each for GitHub Actions, Terraform providers and pre-commit hooks. There is **no `docker` entry**:
+Dependabot cannot authenticate to `public.ecr.aws`, where both images in `app/Dockerfile` live
+([dependabot/proxy#157](https://github.com/dependabot/proxy/issues/157)). Bump the Python base and Lambda Web Adapter
+digests by hand once a month (the `pin-versions` skill), together with the tools in `mise.toml`.
 
 ## Checkpoint: the commands you run
 
@@ -238,7 +254,7 @@ Cold start numbers for [`docs/tradeoffs.md`](docs/tradeoffs.md) section 14: open
 ### 5. Canary
 
 A push deploy releases the merged commit, so a canary must be chosen before the merge. Set the strategy for the
-`dev` environment (these variables are read only when the dispatch input is empty):
+`dev` environment (push deploys read these variables; a manual dispatch uses its own inputs):
 
 ```bash
 gh variable set RELEASE_STRATEGY --env dev --body canary
@@ -274,7 +290,8 @@ still serves the previous `/version`. Revert the change with a PR.
 ### 7. Rollback in dev
 
 Actions > **App Deploy** > Run workflow (`mode` = `rollback`, `sha` = an earlier SHA that was deployed to dev).
-A credential-free gate first checks that this SHA had a green `deploy (dev)` and `verify (dev)` run on `main`.
+A credential-free gate first checks that this SHA had a green release on `main`: `deploy (dev)` with its step
+"Push the image to ECR" and `verify (dev)` (rollback runs never count as green, since they push nothing).
 
 Expect: the summary says the version was reused (no new version published), and `/version` shows the earlier SHA
 and digest within seconds.
@@ -300,7 +317,7 @@ Expect: 0 to add, 1 to change (`aws_ecr_repository_policy.app`, statement `Promo
 AWS_PROFILE=sls-dev-admin terraform -chdir=infra/terraform/bootstrap apply bootstrap.tfplan
 ```
 
-Create environment `prod` and its secrets as in step 2 (`--env prod`, `AWS_PLAN_ROLE_ARN_PROD`,
+Create environment `prod` and its secrets as in step 2 (`--env prod`, and the repo secrets `AWS_PLAN_ROLE_ARN_PROD`,
 `AWS_ACCOUNT_ID_PROD`). Prod also needs a first image before its stack: run **App Promote** (`env` = `prod`,
 `sha` = the SHA dev serves) and approve; expect a green run with the notice "function not created yet". Then
 **Terraform** with `env` = `prod`, then the prod secret:

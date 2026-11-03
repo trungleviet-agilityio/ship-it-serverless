@@ -369,6 +369,7 @@ for wf in "$deploy_wf" "$promote_wf"; do
   ! grep -n 'execute-api' "$wf" | grep -v '^[0-9]*: *#' || die "selftest: ${wf##*/} names an execute-api host outside a comment"
   ! grep -nE '(^|[^a-z])docker (load|push|login|tag)' "$wf" || die "selftest: ${wf##*/} runs docker in a release job"
 done
+# shellcheck disable=SC2016  # workflow text, not shell
 grep -q 'scripts/ci/install-tools.sh "$RUNNER_TEMP/tools" crane' "$deploy_wf" || die "selftest: the deploy job must install crane with the checksum-verified installer"
 ! grep -q 'scripts/image/import.sh' "$deploy_wf" || die "selftest: the deploy job must not load the image into Docker"
 # C4: the environment variables reach the release inputs through env only, never through run text.

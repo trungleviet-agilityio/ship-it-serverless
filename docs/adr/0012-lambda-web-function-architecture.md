@@ -192,8 +192,8 @@ event for `/health` and `/version`, then either:
   bake of `bake_minutes` (default 5) that **invokes the alias directly** (`lambda invoke --qualifier live`, so the
   weights apply and the response names the executed version) with `/health`, `/version` and `/` in rotation. The
   judgment is the HTTP status in each payload served by the new version (any non-2xx or `FunctionError` fails; too
-  few hits on the new version extends the bake up to a cap), then the `Errors` metric with `ExecutedVersion`, read
-  after the metric window settles, as a crash-only second signal (with the Web Adapter an app 500 is a successful
+  few hits on the new version, under 3, extends the bake to at most twice its length), then the `Errors` metric with `ExecutedVersion`, read
+  after the metric window settles (polled for about 3 minutes), as a crash-only second signal (with the Web Adapter an app 500 is a successful
   invoke). Pass: promote to 100 percent. Otherwise: remove the weight and fail the run.
 
 The strategy comes from the dispatch input, else from the environment variable `RELEASE_STRATEGY` (with
@@ -215,10 +215,11 @@ Promote keeps ADR 0008 P9 and P10: `app-promote.yml` dispatch with a green SHA, 
 `promote` copies by digest with crane into the prod repository and runs L7 (strategy input as in dev).
 
 **Rollback** is one path in both workflows: if the function already has a published version whose description
-names the requested digest, the run skips push and publish, smoke-invokes that version and moves `live` (seconds).
+names the requested digest (or, failing that, whose `IMAGE_DIGEST` and resolved image match it), the run skips push and publish, smoke-invokes that version and moves `live` (seconds).
 Prod rolls back by promoting an earlier green SHA (FR-16); dev also gets `app-deploy.yml` dispatch `mode: rollback`
 with a `sha` input, gated by the same credential-free check as promote: the SHA must have a green `deploy (dev)` and
-`verify (dev)` run on `main`. `git revert` stays the normal dev path. Deploy prunes published
+`verify (dev)` run on `main`, and that run's step "Push the image to ECR" succeeded (a rollback run pushes nothing
+and never counts as green). `git revert` stays the normal dev path. Deploy prunes published
 versions beyond the newest 10 that `live` does not reference; ECR keeps 20 images, so no kept version points at a
 deleted image (Finding 7).
 
@@ -384,4 +385,5 @@ CIDR rules are deleted.
 |---|---|
 | 2026-11-03 | Proposed (design only) |
 | 2026-11-03 | Scope change from the owner (relayed by a peer session): the agent decides, builds the lab offline and documents every trade-off. Front door changed from Function URL to HTTP API (L2), canary added (L7), ECS removed (L11), prefix `sls` (L12). Status accepted by the agent |
+| 2026-11-03 | Dependabot `docker` entry removed (ECR Public auth, dependabot/proxy#157); digests bumped by hand monthly. ADR 0007's Docker exception for the deploy job no longer applies (crane push) |
 | 2026-11-03 | Review fixes (B1 to C5): description before publish, ECR pull rights for the apply role, alias-direct canary probes judged on HTTP status, front-door check without credentials, no `*.execute-api` in credentialed jobs, crane push without Docker, green check for dev rollback, `lambda:SourceFunctionArn` on the secret read, exact ECR `aws:sourceArn`, `lambda:Principal` on `AddPermission`, risks R7 to R9 |
