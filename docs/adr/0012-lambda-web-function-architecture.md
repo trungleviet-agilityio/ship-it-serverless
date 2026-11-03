@@ -214,6 +214,7 @@ deleted image (Finding 7).
   `ListVersionsByFunction`, `GetAlias`, `UpdateAlias`, `InvokeFunction`.
 - `lambda:DeleteFunction` on `function:<prefix>-<env>-app:*` only (qualified ARNs, so it can prune versions but never
   delete the function).
+- `apigateway:GET` on `/apis` and `/apis/*` of this region, to find the API endpoint by name.
 - `cloudwatch:GetMetricStatistics` (`*`, no resource-level support) for the canary judgment.
 - `secretsmanager:DescribeSecret` on the one secret (metadata only, ADR 0006 G14).
 - **No `iam:PassRole`**, and an explicit `Deny iam:PassRole` statement, so the execution role can never change
