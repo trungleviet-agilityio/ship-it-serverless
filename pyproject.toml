@@ -1,0 +1,24 @@
+# Dev-tool config only. The app has no runtime dependencies (ADR D4); ruff and mypy run through
+# pre-commit or `uvx`, never from a requirements file.
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+src = ["app/src", "app/tests"]
+# The gate covers the app only; plugins/ is Claude Code tooling, not shipped code.
+extend-exclude = ["plugins"]
+
+[tool.ruff.lint]
+# E/W pycodestyle, F pyflakes, I isort, N naming, UP pyupgrade, B bugbear, S bandit, SIM simplify.
+select = ["E", "W", "F", "I", "N", "UP", "B", "S", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests assert, use a fake key literal and call a local HTTP server on purpose.
+"app/tests/**" = ["S101", "S105", "S106", "S310"]
+
+[tool.mypy]
+python_version = "3.13"
+files = ["app/src", "app/tests"]
+mypy_path = "app/src"
+strict = true
+warn_unreachable = true

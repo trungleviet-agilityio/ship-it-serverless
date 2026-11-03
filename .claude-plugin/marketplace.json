@@ -1,0 +1,15 @@
+{
+  "name": "sis-lab",
+  "description": "Agent team for the ship-it-safely lab",
+  "owner": {
+    "name": "Trung Le",
+    "email": "trung.leviet@asnet.com.vn"
+  },
+  "plugins": [
+    {
+      "name": "sis-team",
+      "source": "./plugins/sis-team",
+      "description": "Plan, Build and Verify agents for shipping Terraform + ECS safely"
+    }
+  ]
+}

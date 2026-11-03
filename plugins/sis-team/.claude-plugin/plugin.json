@@ -1,0 +1,13 @@
+{
+  "name": "sis-team",
+  "displayName": "Ship-it-Safely Team",
+  "version": "0.1.0",
+  "description": "Plan, Build and Verify agents for shipping Terraform + ECS safely: architect, backend and devops builders, e2e, reviewer, security reviewer, simplifier",
+  "author": {
+    "name": "Trung Le",
+    "email": "trung.leviet@asnet.com.vn"
+  },
+  "repository": "https://github.com/trungleviet-agilityio/ship-it-safely",
+  "license": "MIT",
+  "keywords": ["terraform", "aws", "ecs", "github-actions", "oidc", "devsecops"]
+}

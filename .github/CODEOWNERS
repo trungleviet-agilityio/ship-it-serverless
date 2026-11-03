@@ -1,0 +1,4 @@
+# Ownership is documented here and reviews are requested automatically. "Require review from Code Owners" stays off
+# while there is one maintainer: authors cannot approve their own pull requests, so it would block every merge
+# (ADR 0007 S18). Turn it on when a second maintainer joins.
+* @trungleviet-agilityio

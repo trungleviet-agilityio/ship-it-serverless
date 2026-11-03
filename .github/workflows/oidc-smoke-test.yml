@@ -1,0 +1,221 @@
+# OIDC smoke test (PLAN Phase 2, ADR 0003; negative tests ADR 0007 S33). Proves GitHub can assume the dev plan role
+# with no stored keys, and that the trust refuses what it must refuse. The negative calls raise AccessDenied and
+# duration errors on purpose: each run sends a few security alert emails (a demo of the bootstrap alert rule).
+# Not a required status check: it is path filtered, so a skipped run would stay "Pending" (C18).
+# Jobs that assume an AWS role run harden-runner in block mode with telemetry off and an exact allowlist (ADR 0007 S39).
+# Hosts holding the account ID come from secret expressions, never literals. A blocked host fails the job: read its
+# name in the log, add it here (the repo-guard workflow enforces the shape).
+name: OIDC Smoke Test
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/oidc-smoke-test.yml
+      - scripts/aws/assert-session-cap.sh
+      - scripts/aws/assert-web-identity-denied.sh
+      - scripts/aws/check-config.sh
+      - scripts/lib.sh
+      - project.env
+      - scripts/names.sh
+  # Runs only the negative job: a non-PR token must be refused by every role (N1).
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  assume-plan-role:
+    name: prove plan role identity
+    # Fork and Dependabot PRs get no ID token or secrets, so skip them instead of failing.
+    if: >-
+      github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && github.event.pull_request.user.login != 'dependabot[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read # checkout of the scripts
+      # Needed to request the OIDC token that configure-aws-credentials exchanges for the role.
+      id-token: write
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: block
+          disable-telemetry: true
+          disable-sudo-and-containers: true
+          allowed-endpoints: >
+            github.com:443
+            sts.${{ vars.AWS_REGION }}.amazonaws.com:443
+
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check configuration
+        env:
+          ROLE_ARN: ${{ secrets.AWS_PLAN_ROLE_ARN_DEV }}
+          ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID_DEV }}
+          REGION: ${{ vars.AWS_REGION }}
+          ENV: dev
+        run: scripts/aws/check-config.sh plan
+
+      # N8: a pull_request token is refused by the apply and deploy roles (their sub is the dev environment).
+      - name: Apply and deploy roles refuse a pull request token (N8)
+        env:
+          ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID_DEV }}
+          REGION: ${{ vars.AWS_REGION }}
+          ENV: dev
+        run: scripts/aws/assert-web-identity-denied.sh apply deploy
+
+      # N9: the plan role caps a session at 3600 seconds, and a short session reports when it ends.
+      - name: Plan role caps the session at one hour (N9)
+        env:
+          ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID_DEV }}
+          REGION: ${{ vars.AWS_REGION }}
+          ENV: dev
+        run: scripts/aws/assert-session-cap.sh plan
+
+      - name: Assume the plan role
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN_DEV }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-oidc-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          mask-aws-account-id: true
+          retry-max-attempts: 3
+
+      - name: Prove identity
+        env:
+          ROLE_ARN: ${{ secrets.AWS_PLAN_ROLE_ARN_DEV }}
+        run: |
+          aws --version
+          identity="$(aws sts get-caller-identity --output json)"
+          account="$(jq -r '.Account' <<<"$identity")"
+          echo "::add-mask::$account"
+          arn="$(jq -r '.Arn' <<<"$identity")"
+          role="$(ENV=dev scripts/names.sh gha-role plan)"
+          if [[ ! "$arn" =~ ^arn:aws:sts::[0-9]{12}:assumed-role/${role}/gha-oidc-smoke- ]]; then
+            echo "::error::Caller identity is not the ${role} role"
+            exit 1
+          fi
+          role_account="${ROLE_ARN#arn:aws:iam::}"
+          role_account="${role_account%%:*}"
+          if [[ "$account" != "$role_account" ]]; then
+            echo "::error::Caller account differs from the account in AWS_PLAN_ROLE_ARN_DEV"
+            exit 1
+          fi
+          echo "Assumed identity: $arn"
+          {
+            echo "### OIDC smoke test"
+            echo "Assumed \`${arn#*:assumed-role/}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  roles-deny-outside-pr:
+    name: refuse non-PR token (N1)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read # checkout of the scripts
+      # Needed to request the OIDC token whose sub must be refused.
+      id-token: write
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: block
+          disable-telemetry: true
+          disable-sudo-and-containers: true
+          allowed-endpoints: >
+            github.com:443
+            sts.${{ vars.AWS_REGION }}.amazonaws.com:443
+
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check configuration
+        env:
+          ROLE_ARN: ${{ secrets.AWS_PLAN_ROLE_ARN_DEV }}
+          ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID_DEV }}
+          REGION: ${{ vars.AWS_REGION }}
+          ENV: dev
+        run: scripts/aws/check-config.sh plan
+
+      # A script that calls STS directly, not configure-aws-credentials: that action fails on network, token or ARN
+      # errors too, so "any failure" would pass. Here only an explicit AccessDenied passes. The workflow_dispatch
+      # token has neither the pull_request sub nor the environment sub, so plan, apply and deploy must all refuse.
+      - name: Require an explicit access denied from every role
+        env:
+          ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID_DEV }}
+          REGION: ${{ vars.AWS_REGION }}
+          ENV: dev
+        run: scripts/aws/assert-web-identity-denied.sh plan apply deploy
+
+      # The same refusal from the prod roles (ADR 0008 S5, N1 for prod).
+      - name: Check prod configuration
+        env:
+          ROLE_ARN: ${{ secrets.AWS_PLAN_ROLE_ARN_PROD }}
+          ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID_PROD }}
+          REGION: ${{ vars.AWS_REGION }}
+          ENV: prod
+        run: scripts/aws/check-config.sh plan
+
+      - name: Require an explicit access denied from every prod role
+        env:
+          ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID_PROD }}
+          REGION: ${{ vars.AWS_REGION }}
+          ENV: prod
+        run: scripts/aws/assert-web-identity-denied.sh plan apply deploy
+
+  # N10 (PLAN 7.5, ADR 0010 T5): a job approved in the dev environment carries sub ...:environment:dev, which no prod
+  # role trusts. Its job_workflow_ref (this file) is not in the prod apply or deploy trust either, so for those two
+  # roles two claims differ; the plan role pins no file, so for it only the sub differs. Each must answer AccessDenied.
+  # Needs an approval of dev and sends prod security alert emails, by design.
+  dev-env-denied-by-prod:
+    name: prod refuses a dev token (N10)
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: dev
+    permissions:
+      contents: read # checkout of the scripts
+      # Needed to request the OIDC token (sub ...:environment:dev) that the prod roles must refuse.
+      id-token: write
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: block
+          disable-telemetry: true
+          disable-sudo-and-containers: true
+          allowed-endpoints: >
+            github.com:443
+            sts.${{ vars.AWS_REGION }}.amazonaws.com:443
+
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check prod configuration
+        env:
+          ROLE_ARN: ${{ secrets.AWS_PLAN_ROLE_ARN_PROD }}
+          ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID_PROD }}
+          REGION: ${{ vars.AWS_REGION }}
+          ENV: prod
+        run: scripts/aws/check-config.sh plan
+
+      - name: Require an explicit access denied from every prod role
+        env:
+          ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID_PROD }}
+          REGION: ${{ vars.AWS_REGION }}
+          ENV: prod
+        run: scripts/aws/assert-web-identity-denied.sh plan apply deploy

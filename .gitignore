@@ -1,0 +1,50 @@
+# App
+app/.env
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+
+# Terraform
+.terraform/
+# Per-account data dir of the bootstrap runs (TF_DATA_DIR=.terraform-<env>, ADR 0008)
+.terraform-*/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+# Account-specific inputs stay local; commit the *.example files
+infra/terraform/bootstrap/accounts/*.tfvars
+!infra/terraform/bootstrap/accounts/*.tfvars.example
+# Backend configs may hold account IDs; commit only *.tfbackend.example
+*.tfbackend
+!*.tfbackend.example
+# Plan JSON, JSON vars and local auto vars can hold values; envs/*/terraform.tfvars stays committed (FR-6)
+*.tfvars.json
+infra/terraform/envs/*/*.auto.tfvars
+infra/terraform/**/*.auto.tfvars
+infra/terraform/**/*.tfvars
+!infra/terraform/envs/*/terraform.tfvars
+!**/*.tfvars.example
+*.tfplan.json
+tfplan.json
+
+# Claude Code personal files
+.claude/settings.local.json
+CLAUDE.local.md
+
+# OS
+.DS_Store
+
+# Local hash-locked CI tools (make venv)
+.venv-ci/
+
+# The phase plan and progress tracker are the maintainer's working notes, kept outside the repo (2026-10-30).
+/PLAN.md
+/PROGRESS.md

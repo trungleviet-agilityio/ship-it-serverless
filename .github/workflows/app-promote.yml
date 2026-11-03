@@ -1,0 +1,214 @@
+# App promote to prod (PLAN Phase 7, ADR 0008 P9, P10, S2, ADR 0010, FR-13, FR-16).
+# A manual run on main takes a commit SHA that app-deploy already deployed to dev, copies that exact image (same
+# digest, no rebuild) from the dev ECR to the prod ECR, registers a prod task definition revision that references the
+# digest, updates the prod service and waits for the rollout. Rollback is the same run with an earlier green SHA: the
+# prod tag already holds that digest, so nothing is copied (scripts/image/promote-copy.sh).
+# The file path is part of the prod deploy role trust (ADR 0008 P7): bootstrap `workflow_files` lists app-promote.yml
+# when promotion_source_account_id is set.
+# Two jobs: `resolve` proves the SHA was green in dev with git and the GitHub API only (no token, no environment, no
+# secret); `promote` is the only job that can assume the prod deploy role, after the prod environment is approved.
+# Jobs that assume an AWS role run harden-runner in block mode with telemetry off and an exact allowlist (ADR 0007 S39).
+# Hosts holding an account ID come from secret expressions, never literals. The dev registry host is the one named
+# exception of the harden-runner policy (ADR 0008 P8).
+name: App Promote
+run-name: Promote ${{ inputs.sha }} to ${{ inputs.env }} by ${{ github.actor }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: Environment to promote to
+        type: choice
+        options: [prod]
+        required: true
+        default: prod
+      sha:
+        description: Full commit SHA on main that app-deploy deployed to dev (an earlier one rolls back)
+        type: string
+        required: true
+
+permissions: {}
+
+env:
+  # The target environment. The scripts derive every target resource name from it (app_names in scripts/lib.sh).
+  ENV: ${{ inputs.env }}
+
+jobs:
+  resolve:
+    name: resolve (green in dev)
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # No OIDC token, no deployment environment, no secrets: this job cannot reach AWS.
+    permissions:
+      contents: read
+      actions: read # gh run list: the app-deploy run of the SHA
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+
+      # The full history: the SHA must be an ancestor of origin/main.
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Require a green dev deploy of the SHA
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ inputs.sha }}
+        run: scripts/image/promote-resolve.sh "$SHA"
+
+  promote:
+    name: promote (prod)
+    needs: resolve
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # The environment adds the required reviewer and sets the OIDC subject the prod deploy role trusts.
+    environment: ${{ inputs.env }}
+    # One promotion of an environment at a time; a running one is never cancelled.
+    concurrency:
+      group: app-promote-${{ inputs.env }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write # OIDC token for the role assumed by configure-aws-credentials
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: block
+          disable-telemetry: true
+          # crane copies registry to registry: no Docker, so containers stay off (ADR 0008 P9).
+          disable-sudo-and-containers: true
+          allowed-endpoints: >
+            github.com:443
+            release-assets.githubusercontent.com:443
+            sts.${{ vars.AWS_REGION }}.amazonaws.com:443
+            api.ecr.${{ vars.AWS_REGION }}.amazonaws.com:443
+            ${{ secrets.AWS_ACCOUNT_ID_DEV }}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com:443
+            ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com:443
+            prod-${{ vars.AWS_REGION }}-starport-layer-bucket.s3.${{ vars.AWS_REGION }}.amazonaws.com:443
+            ecs.${{ vars.AWS_REGION }}.amazonaws.com:443
+            secretsmanager.${{ vars.AWS_REGION }}.amazonaws.com:443
+
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Derive the resource names
+        run: scripts/names.sh app >> "$GITHUB_ENV"
+
+      - name: Install crane (checksum verified)
+        run: scripts/ci/install-tools.sh "$RUNNER_TEMP/tools" crane
+
+      - name: Check configuration
+        env:
+          ROLE_ARN: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID }}
+          REGION: ${{ vars.AWS_REGION }}
+        run: scripts/aws/check-config.sh deploy
+
+      - name: Assume the deploy role
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-promote-${{ github.run_id }}-${{ github.run_attempt }}
+          mask-aws-account-id: true
+          retry-max-attempts: 3
+
+      # The prod stack is up, its secret has a current value, and the deploy role is denied the value (N4).
+      - name: Preflight (the stack is up, N4)
+        run: scripts/ecs/preflight.sh
+
+      # Copy by digest, or reuse the digest prod already holds for this SHA (rollback). Prints IMAGE_DIGEST and
+      # PROMOTE_COPIED only; the registry hosts never reach the log.
+      - name: Copy the image by digest
+        env:
+          SOURCE_ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID_DEV }}
+          ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID }}
+          REGION: ${{ vars.AWS_REGION }}
+          SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          source_name="$(ENV=dev scripts/names.sh app | sed -n 's/^REPOSITORY=//p')"
+          [[ -n "$source_name" ]] || { echo "::error::no dev repository name"; exit 1; }
+          source_repo="${SOURCE_ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com/${source_name}"
+          target_repo="${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com/${REPOSITORY}"
+          out="$(scripts/image/promote-copy.sh "$source_repo" "$target_repo" "$SHA" "$RUNNER_TEMP")"
+          digest="$(sed -n 's/^IMAGE_DIGEST=//p' <<<"$out")"
+          copied="$(sed -n 's/^PROMOTE_COPIED=//p' <<<"$out")"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::promote-copy returned no digest"; exit 1; }
+          {
+            echo "IMAGE_DIGEST=${digest}"
+            echo "IMAGE_REF=${target_repo}@${digest}"
+            echo "PROMOTE_COPIED=${copied}"
+          } >> "$GITHUB_ENV"
+
+      # Terraform owns the shape of the task definition; this step replaces only the image. The render refuses a
+      # revision whose APP_ENV is not this environment, so a hand-made revision is never promoted (ADR 0008 S4).
+      - name: Render the task definition
+        env:
+          SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          aws ecs describe-task-definition --task-definition "$FAMILY" --query taskDefinition --output json \
+            >"$RUNNER_TEMP/td-current.json"
+          scripts/ecs/render-task-def.sh --env "$ENV" "$RUNNER_TEMP/td-current.json" "$IMAGE_REF" "$SHA" >"$RUNNER_TEMP/td.json"
+          echo "Rendered a new revision of ${FAMILY} for image ${IMAGE_DIGEST}"
+
+      - name: Register the task definition
+        run: |
+          set -euo pipefail
+          td_arn="$(aws ecs register-task-definition --cli-input-json "file://$RUNNER_TEMP/td.json" \
+            --query taskDefinition.taskDefinitionArn --output text)"
+          echo "TD_ARN=${td_arn}" >> "$GITHUB_ENV"
+          echo "Registered ${td_arn##*/}"
+
+      - name: Update the service
+        run: |
+          set -euo pipefail
+          aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" --task-definition "$TD_ARN" \
+            --query "service.deployments[?status=='PRIMARY'].id" --output text >/dev/null
+          echo "Update started for ${TD_ARN##*/}"
+
+      # Not the AWS CLI stability waiter: it also succeeds after a circuit-breaker rollback (ADR 0005, Finding 2).
+      - name: Wait for the rollout
+        run: scripts/ecs/wait-deployment.sh "$CLUSTER" "$SERVICE" "$TD_ARN"
+
+      - name: Summary
+        if: always()
+        env:
+          ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID }}
+          JOB_STATUS: ${{ job.status }}
+          SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          revision="not registered"
+          if [[ -n "${TD_ARN:-}" ]]; then
+            revision="${TD_ARN##*/}"
+          fi
+          case "${PROMOTE_COPIED:-}" in
+            true) how="copied from dev by digest" ;;
+            false) how="already in ${ENV} (rollback or re-run): reused" ;;
+            *) how="not resolved" ;;
+          esac
+          role="$(scripts/names.sh role 2>/dev/null)" || role="not assumed"
+          {
+            echo "### app-promote"
+            echo "Commit: \`${SHA}\`"
+            echo "Image digest: \`${IMAGE_DIGEST:-not resolved}\` (${how})"
+            echo "Task definition: \`${revision}\`"
+            echo "Result: ${JOB_STATUS}"
+            echo "Role: \`${role}\`"
+          } | scripts/aws/assert-no-account-id.sh >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove the task definition files
+        if: always()
+        run: rm -f "$RUNNER_TEMP/td-current.json" "$RUNNER_TEMP/td.json"

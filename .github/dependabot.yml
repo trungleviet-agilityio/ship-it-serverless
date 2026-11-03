@@ -1,0 +1,75 @@
+# Version updates (NFR-5, ADR 0007 S5). One monthly PR per ecosystem, with a cooldown so a bad release can be pulled
+# before it is proposed (security updates ignore the cooldown). Commit titles read `<prefix>(deps): ...`.
+# Not covered, so they get a monthly manual check (PROGRESS): the tool versions in mise.toml with
+# scripts/ci/tools.sha256, and scripts/ci/requirements.txt (a uv-compiled, hash-locked file; no `pip` entry on purpose).
+# Terraform PRs from the bot get no plan (no secrets for Dependabot). Re-open one from a maintainer branch before
+# merging it, so the plan role runs.
+version: 2
+
+updates:
+  # Every workflow and the local composite action in one PR. The version stays in the comment after the SHA.
+  - package-ecosystem: github-actions
+    directories:
+      - /
+      - /.github/actions/terraform-setup
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: ci
+      include: scope
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # The one `FROM ... AS base` line in app/Dockerfile (image/build.sh swaps its registry with a build context).
+  # Python stays on 3.13: only digest and patch updates arrive (ADR 0007 S46).
+  - package-ecosystem: docker
+    directory: /app
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: build
+      include: scope
+    groups:
+      base-image:
+        patterns: ["*"]
+    ignore:
+      - dependency-name: docker/library/python
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-major
+
+  # Provider and lock file updates. The globs pick up envs/prod in Phase 7.
+  - package-ecosystem: terraform
+    directories:
+      - /infra/terraform/bootstrap
+      - /infra/terraform/envs/*
+      - /infra/terraform/modules/*
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: infra
+      include: scope
+    groups:
+      terraform:
+        patterns: ["*"]
+
+  # Hook revs in .pre-commit-config.yaml. Keep only while the PRs preserve the `# frozen: vX` comments (ADR 0007 Q4).
+  - package-ecosystem: pre-commit
+    directory: /
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      hooks:
+        patterns: ["*"]

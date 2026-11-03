@@ -1,0 +1,5 @@
+# Copy to dev.tfvars (gitignored) and fill in. Never commit real values.
+aws_account_id  = "<DEV_ACCOUNT_ID>"
+budget_email    = "<BUDGET_EMAIL>"
+github_owner_id = "<OWNER_ID>" # gh api repos/OWNER/REPO --jq .owner.id
+github_repo_id  = "<REPO_ID>"  # gh api repos/OWNER/REPO --jq .id

@@ -1,0 +1,15 @@
+# Project CLI tools, pinned to exact versions (NFR-3). `mise install` from the repo root installs them;
+# inside the repo mise puts these versions first on PATH. Python dependencies stay with uv / pyproject.toml.
+# Bump a version here in its own `chore(repo)` commit and run `make check`.
+[tools]
+terraform = "1.17.0"
+terraform-docs = "0.24.0"
+tflint = "0.65.0"
+actionlint = "1.7.12"
+hadolint = "2.15.1"
+shellcheck = "0.11.0"
+gitleaks = "8.30.1"
+trivy = "0.76.1"
+crane = "0.22.1"
+pre-commit = "4.7.0"
+uv = "0.13.5"

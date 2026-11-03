@@ -1,0 +1,70 @@
+# Revs are pinned to full commit SHAs; the release tag is in the `frozen` comment (NFR-3).
+default_install_hook_types: [pre-commit, commit-msg]
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: 83d9cd684c87d95d656c1458ef04895a7f1cbd8e # frozen: v8.30.1
+    hooks:
+      - id: gitleaks
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c # frozen: v6.0.0
+    hooks:
+      - id: check-yaml
+      - id: end-of-file-fixer
+      - id: detect-private-key
+
+  - repo: https://github.com/antonbabenko/pre-commit-terraform
+    rev: 443ffdff1cc1663b701ae73e7459029fe883455a # frozen: v1.109.3
+    hooks:
+      - id: terraform_fmt
+      - id: terraform_validate
+      - id: terraform_tflint
+      # Inputs/outputs/resources tables in each Terraform README (ADR 0001, D16). Settings: .terraform-docs.yml.
+      - id: terraform_docs
+        args:
+          - --args=--config=.terraform-docs.yml
+
+  # D2: no AWS account ID in git. gitleaks does not look for them. The AWS doc example ID and repeated-digit placeholders are allowed.
+  - repo: local
+    hooks:
+      - id: no-aws-account-id
+        name: no bare 12-digit AWS account ID
+        language: pygrep
+        # Alphanumeric boundaries: a digit run inside a 40-hex SHA pin is bounded by letters or digits.
+        entry: '(?<![0-9A-Za-z])(?!123456789012|111111111111|222222222222)[0-9]{12}(?![0-9A-Za-z])'
+        types: [text]
+        exclude: (^|/)\.terraform\.lock\.hcl$
+
+  # Workflow security audits (offline): dangerous-triggers (ADR 0002 L3), template-injection,
+  # excessive-permissions, unpinned-uses. No global disables; inline ignores only where
+  # docs/reference/standards/ci-cd.md allows them (self-repository, one github-env).
+  - repo: https://github.com/zizmorcore/zizmor-pre-commit
+    rev: c92afdf2c6ca336aaa8f39e2bd8d48f62dbd8e1f # frozen: v1.31.1
+    hooks:
+      - id: zizmor
+
+  # App gate (pyproject.toml holds the config). Scoped to app/ so ruff-format leaves markdown alone.
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: f368fb366ff7f2f808dd324b83a6d32267799e19 # frozen: v0.17.2
+    hooks:
+      - id: ruff-check
+        files: ^(app/|scripts/.*\.py$)
+      - id: ruff-format
+        files: ^(app/|scripts/.*\.py$)
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: 2834ec6639549dd6796205c8f011dedcd587288b # frozen: v2.4.0
+    hooks:
+      - id: mypy
+        # Check the files listed in pyproject.toml as one program, with its strict settings.
+        args: []
+        pass_filenames: false
+        files: ^(app/|pyproject\.toml$)
+
+  # Commit messages: Conventional Commits plus `infra` (see .claude/skills/pr-conventions).
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: 91ab4bf57e58b32adf1a122681f6ebe164d081c8 # frozen: v4.4.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]
+        args: [feat, fix, refactor, perf, test, docs, build, ci, infra, chore, style, revert]

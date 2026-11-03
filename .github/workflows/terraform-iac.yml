@@ -1,0 +1,253 @@
+# Terraform pipeline for the envs/<env> roots (PLAN Phase 3, ADR 0004, FR-9, ADR 0008).
+# A pull request plans each environment with the read-only plan role (reusable-terraform-plan.yml, one `plan-<env>`
+# caller job per environment) and posts an account-free comment. A push to main applies dev only; a manual run picks
+# the environment. Both apply with the apply role after approval of the GitHub environment of that name.
+# The file path is part of the apply role trust (ADR 0007 S2): the bootstrap `workflow_files` must list terraform-iac.yml.
+# Jobs that assume an AWS role run harden-runner in block mode with telemetry off and an exact allowlist (ADR 0007 S39).
+# Hosts holding the account ID come from secret expressions, never literals. A blocked host fails the job: read its
+# name in the log, add it here (the repo-guard workflow enforces the shape).
+name: Terraform
+run-name: >-
+  ${{ github.event_name == 'pull_request'
+  && format('Terraform plan · PR #{0}', github.event.pull_request.number)
+  || format('Terraform apply · {0} by {1}', inputs.env || 'dev', github.actor) }}
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - infra/**
+      - .github/workflows/terraform-iac.yml
+      - .github/workflows/reusable-terraform-plan.yml
+      - .github/actions/terraform-setup/action.yml
+      - scripts/tf/check.sh
+      - scripts/tf/policy.sh
+      - scripts/tf/resolved-sources.sh
+      - scripts/ci/install-tools.sh
+      - scripts/ci/tools.sha256
+      - scripts/ci/requirements.txt
+      - scripts/guard/workflow-triggers.sh
+      - scripts/guard/env-parity.sh
+      - scripts/tf/plan-summary.sh
+      - scripts/tf/init.sh
+      - scripts/aws/check-config.sh
+      - scripts/aws/assert-no-account-id.sh
+      - scripts/names.sh
+      - scripts/tf/plan-role-guardrails.sh
+      - scripts/tf/mask-cidrs.sh
+      - scripts/aws/redact-account-ids.sh
+      - scripts/lib.sh
+      - project.env
+      - mise.toml
+      - .tflint.hcl
+  push:
+    branches: [main]
+    paths:
+      - infra/terraform/envs/dev/**
+      - infra/terraform/modules/**
+      - .github/workflows/terraform-iac.yml
+  # Runs only the apply job: re-creates the stack after a teardown without re-running an old commit.
+  workflow_dispatch:
+    inputs:
+      env:
+        description: Environment to apply
+        type: choice
+        options: [dev, prod]
+        required: false
+        default: dev
+
+permissions: {}
+
+# Nothing is cancelled mid-run: a cancelled plan can leave the state lock held, so runs queue instead.
+# The no-AWS checks job cannot hold a lock, but one setting keeps the rule simple.
+# The environment is part of the group, so a dev apply that waits for approval cannot block or replace a prod dispatch.
+# The job-level group of the apply (terraform-envs-<env>) is the one that serialises writers of one state.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}-${{ inputs.env || 'dev' }}
+  cancel-in-progress: false
+
+env:
+  TF_IN_AUTOMATION: "1"
+  TF_INPUT: "0"
+  # No HashiCorp version check call: checkpoint-api.hashicorp.com is not in the allowlists (ADR 0007 S44).
+  CHECKPOINT_DISABLE: "1"
+  # The single key: the scripts and the steps derive the environment root, the role names and the titles from it.
+  # A push has no inputs, so it applies dev.
+  ENV: ${{ inputs.env || 'dev' }}
+
+jobs:
+  checks:
+    name: checks
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Terraform and tflint (checksum verified)
+        run: scripts/ci/install-tools.sh "$RUNNER_TEMP/tools"
+
+      - name: Terraform checks (policy rules, README, fmt, validate, test)
+        run: make tf-check
+
+      - name: Install tflint plugins
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: tflint --init
+
+      - name: tflint
+        run: tflint --recursive
+
+  # One caller job per environment (ADR 0008, P6; the parity guard checks the set). Secrets are mapped by name, never
+  # inherited. The caller grants the union of what the called jobs need; each called job narrows it again.
+  plan-dev:
+    name: plan (dev)
+    needs: checks
+    # Fork and Dependabot PRs get no secrets, and the called workflow requires them: skip the caller, not just the jobs.
+    if: >-
+      github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && github.event.pull_request.user.login != 'dependabot[bot]'
+    permissions:
+      contents: read
+      id-token: write # the called plan jobs assume the plan role
+      pull-requests: write # the called comment job posts the sticky comment
+    uses: ./.github/workflows/reusable-terraform-plan.yml # zizmor: ignore[self-repository]
+    with:
+      env: dev
+    secrets:
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID_DEV }}
+      AWS_PLAN_ROLE_ARN: ${{ secrets.AWS_PLAN_ROLE_ARN_DEV }}
+      ALB_INGRESS_CIDRS: ${{ secrets.ALB_INGRESS_CIDRS_DEV }}
+      # dev promotes to prod (terraform.tfvars promotion_target_env): the dev ECR repository policy names the prod
+      # account (ADR 0008 P9). The only cross-env secret a caller may map; the parity guard checks it.
+      PROMOTION_TARGET_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID_PROD }}
+
+  plan-prod:
+    name: plan (prod)
+    needs: checks
+    if: >-
+      github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && github.event.pull_request.user.login != 'dependabot[bot]'
+    permissions:
+      contents: read
+      id-token: write # the called plan jobs assume the plan role
+      pull-requests: write # the called comment job posts the sticky comment
+    uses: ./.github/workflows/reusable-terraform-plan.yml # zizmor: ignore[self-repository]
+    with:
+      env: prod
+    secrets:
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID_PROD }}
+      AWS_PLAN_ROLE_ARN: ${{ secrets.AWS_PLAN_ROLE_ARN_PROD }}
+      ALB_INGRESS_CIDRS: ${{ secrets.ALB_INGRESS_CIDRS_PROD }}
+
+  apply:
+    name: apply
+    # Only main applies, and only after a push or a manual run. Never a pull request.
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # The environment adds the required reviewer and sets the OIDC subject the apply role trusts. Its secrets
+    # (AWS_ACCOUNT_ID, AWS_APPLY_ROLE_ARN, ALB_INGRESS_CIDRS) belong to that environment, under the same names in each.
+    # ALB_INGRESS_CIDRS is required: the apply fails while it is empty (a JSON list, or ["0.0.0.0/0"] to be open).
+    environment: ${{ inputs.env || 'dev' }}
+    concurrency:
+      group: terraform-envs-${{ inputs.env || 'dev' }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write # OIDC token for the role assumed by configure-aws-credentials
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: block
+          disable-telemetry: true
+          disable-sudo-and-containers: true
+          allowed-endpoints: >
+            github.com:443
+            release-assets.githubusercontent.com:443
+            releases.hashicorp.com:443
+            registry.terraform.io:443
+            sts.${{ vars.AWS_REGION }}.amazonaws.com:443
+            sis-${{ env.ENV }}-tfstate-${{ secrets.AWS_ACCOUNT_ID }}-${{ vars.AWS_REGION }}-an.s3.${{ vars.AWS_REGION }}.amazonaws.com:443
+            ec2.${{ vars.AWS_REGION }}.amazonaws.com:443
+            elasticloadbalancing.${{ vars.AWS_REGION }}.amazonaws.com:443
+            ecs.${{ vars.AWS_REGION }}.amazonaws.com:443
+            api.ecr.${{ vars.AWS_REGION }}.amazonaws.com:443
+            logs.${{ vars.AWS_REGION }}.amazonaws.com:443
+            secretsmanager.${{ vars.AWS_REGION }}.amazonaws.com:443
+            iam.amazonaws.com:443
+
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Select the root, install the tools, check the config, assume the apply role, init and mask the CIDRs. The
+      # apply refuses an empty ALB_INGRESS_CIDRS before the role is assumed: unset would open the ALB to 0.0.0.0/0
+      # while the PR plan (repository secret ALB_INGRESS_CIDRS_<ENV>) looked restricted. To open it on purpose, set the
+      # environment secret to ["0.0.0.0/0"]. A local action: it needs the checkout above.
+      - name: Set up Terraform with the apply role
+        uses: ./.github/actions/terraform-setup # zizmor: ignore[self-repository]
+        with:
+          env: ${{ env.ENV }}
+          role-kind: apply
+          role-arn: ${{ secrets.AWS_APPLY_ROLE_ARN }}
+          account-id: ${{ secrets.AWS_ACCOUNT_ID }}
+          region: ${{ vars.AWS_REGION }}
+          session-prefix: apply
+          alb-ingress-cidrs: ${{ secrets.ALB_INGRESS_CIDRS }}
+          require-alb-ingress-cidrs: "true"
+
+      # A fresh plan of main inside the approved job, not a saved PR plan (ADR 0004, E24, R5).
+      - name: Terraform plan
+        env:
+          TF_VAR_aws_account_id: ${{ secrets.AWS_ACCOUNT_ID }}
+          TF_VAR_alb_ingress_cidrs_json: ${{ secrets.ALB_INGRESS_CIDRS }}
+          # Environment secret of dev only (the prod account, for the dev ECR repository policy, ADR 0008 P9). Unset in
+          # prod, where terraform.tfvars sets no promotion target and the value is ignored.
+          TF_VAR_promotion_target_account_id: ${{ secrets.PROMOTION_TARGET_ACCOUNT_ID }}
+        run: terraform -chdir="$TF_DIR" plan -lock-timeout=5m -no-color -out=tfplan
+
+      - name: Summarize the plan
+        env:
+          ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          summary="$(terraform -chdir="$TF_DIR" show -json tfplan | scripts/tf/plan-summary.sh | scripts/aws/assert-no-account-id.sh)"
+          printf '%s\n' "$summary" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Terraform apply
+        run: terraform -chdir="$TF_DIR" apply -input=false -lock-timeout=5m -no-color tfplan
+
+      # configure-aws-credentials masks the whole assumed-role ARN in logs, so the summary shows which role ran (role
+      # name only, never the session).
+      - name: Report the result
+        run: |
+          set -euo pipefail
+          alb_url="$(terraform -chdir="$TF_DIR" output -raw alb_url)"
+          role="$(scripts/names.sh role 2>/dev/null)" || role="not assumed"
+          {
+            echo "### Applied"
+            echo "ALB URL: ${alb_url}"
+            echo "Role: \`${role}\`"
+            echo "The service stays unhealthy until the secret value is set and app-deploy runs (Run workflow)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove the plan file
+        if: always()
+        run: rm -f "$TF_DIR/tfplan"

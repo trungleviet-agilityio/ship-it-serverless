@@ -1,0 +1,229 @@
+# App deploy to dev (PLAN Phase 4, ADR 0005, FR-11, FR-14, FR-15).
+# A push to main (or a manual run on main) builds the image once, smoke tests and scans it, pushes it to the dev ECR
+# by an immutable tag, registers a task definition revision that references the image digest, updates the ECS
+# service and waits for the rollout. The file path is part of the deploy role trust (ADR 0007 S2): the bootstrap
+# `workflow_files` must list app-deploy.yml.
+# Two jobs, because `id-token` and `environment` apply to every step of a job: `build-scan` runs the build, the
+# smoke test and the scan with no token, no environment and no secret (F9); `deploy` loads exactly the bytes that
+# job produced (sha256 checked) and is the only job that can assume the deploy role.
+# Jobs that assume an AWS role run harden-runner in block mode with telemetry off and an exact allowlist (ADR 0007 S39).
+# Hosts holding the account ID come from secret expressions, never literals. A blocked host fails the job: read its
+# name in the log, add it here (the repo-guard workflow enforces the shape).
+name: App Deploy
+run-name: Deploy ${{ github.ref_name }} to dev by ${{ github.actor }}
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - app/**
+      - .github/workflows/app-deploy.yml
+      - scripts/lib.sh
+      - project.env
+      - scripts/names.sh
+      - scripts/image/smoke.sh
+      - scripts/aws/assert-no-account-id.sh
+      - scripts/image/build.sh
+      - scripts/aws/check-config.sh
+      - scripts/ci/tools.sha256
+      - scripts/image/ecr-push.sh
+      - scripts/ecs/preflight.sh
+      - scripts/ecs/wait-deployment.sh
+      - scripts/image/export.sh
+      - scripts/image/import.sh
+      - scripts/image/verify.sh
+      - scripts/ci/install-tools.sh
+      - scripts/ecs/render-task-def.sh
+      - scripts/image/scan.sh
+      - mise.toml
+  # Deploys main HEAD, for example after the dev stack was re-created. Both jobs refuse any other ref.
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  # The environment name. The scripts derive every resource name from it (app_names in scripts/lib.sh).
+  ENV: dev
+  GIT_SHA: ${{ github.sha }}
+
+jobs:
+  build-scan:
+    name: build, scan
+    # Only main builds for a deploy: a branch run would build an image nobody may deploy.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # No OIDC token, no deployment environment, no secrets: nothing in this job can reach AWS (the CI self-tests check it).
+    permissions:
+      contents: read
+    outputs:
+      image-sha256: ${{ steps.export.outputs.sha256 }}
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install trivy (checksum verified)
+        run: scripts/ci/install-tools.sh "$RUNNER_TEMP/tools" trivy
+
+      # Build (the unit tests run inside), smoke test like Fargate, scan. A fixable HIGH or CRITICAL finding blocks
+      # the deploy (ADR 0005, Q4).
+      - name: Build, smoke test and scan the image
+        run: scripts/image/verify.sh "$GIT_SHA" "$RUNNER_TEMP/scan"
+
+      - name: Save the image and compute its sha256
+        id: export
+        run: scripts/image/export.sh "$GIT_SHA" "$RUNNER_TEMP/image" >> "$GITHUB_OUTPUT"
+
+      # Artifacts on a public repo are downloadable, so the retention is one day. The deploy job checks the sha256.
+      - name: Upload the image
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: app-image
+          path: ${{ runner.temp }}/image/image.tar
+          retention-days: 1
+          if-no-files-found: error
+
+  deploy:
+    name: deploy (dev)
+    needs: build-scan
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # The environment adds the required reviewer and sets the OIDC subject the deploy role trusts. Its name cannot
+    # come from `env`: the environments context is not available here.
+    environment: dev
+    # A newer pending run replaces an older pending one, so the latest commit wins. A running deploy is never
+    # cancelled. Only this job holds AWS state, so only this job needs the lock.
+    concurrency:
+      group: app-deploy-dev
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write # OIDC token for the role assumed by configure-aws-credentials
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: block
+          disable-telemetry: true
+          # No disable-sudo-and-containers: this job runs docker load and docker push (named exception in the policy).
+          allowed-endpoints: >
+            github.com:443
+            sts.${{ vars.AWS_REGION }}.amazonaws.com:443
+            api.ecr.${{ vars.AWS_REGION }}.amazonaws.com:443
+            ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com:443
+            prod-${{ vars.AWS_REGION }}-starport-layer-bucket.s3.${{ vars.AWS_REGION }}.amazonaws.com:443
+            ecs.${{ vars.AWS_REGION }}.amazonaws.com:443
+            secretsmanager.${{ vars.AWS_REGION }}.amazonaws.com:443
+
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Derive the resource names
+        run: scripts/names.sh app >> "$GITHUB_ENV"
+
+      - name: Download the image
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: app-image
+          path: ${{ runner.temp }}/image
+
+      # The sha256 comes from the build job output, not from the artifact, so a replaced artifact is refused.
+      - name: Load the image (sha256 verified)
+        env:
+          EXPECTED_SHA256: ${{ needs.build-scan.outputs.image-sha256 }}
+        run: scripts/image/import.sh "$RUNNER_TEMP/image/image.tar" "$EXPECTED_SHA256"
+
+      - name: Check configuration
+        env:
+          ROLE_ARN: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID }}
+          REGION: ${{ vars.AWS_REGION }}
+        run: scripts/aws/check-config.sh deploy
+
+      - name: Assume the deploy role
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-deploy-${{ github.run_id }}-${{ github.run_attempt }}
+          mask-aws-account-id: true
+          retry-max-attempts: 3
+
+      # Fail rather than skip, so a green run always means "deployed" (ADR 0005, F16, Q2). Also N4: the deploy
+      # role must be denied the secret value.
+      - name: Preflight (the stack is up, N4)
+        run: scripts/ecs/preflight.sh
+
+      # Push once, by immutable tag; a re-run reuses the image that was scanned. The digest comes from ECR.
+      - name: Push the image to ECR
+        env:
+          ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID }}
+          REGION: ${{ vars.AWS_REGION }}
+        run: scripts/image/ecr-push.sh "$REPOSITORY" "$GIT_SHA" "$(scripts/names.sh image "$GIT_SHA")" >> "$GITHUB_ENV"
+
+      # Terraform owns the shape of the task definition; this step replaces only the image (ADR 0005, F2 to F4).
+      - name: Render the task definition
+        run: |
+          set -euo pipefail
+          aws ecs describe-task-definition --task-definition "$FAMILY" --query taskDefinition --output json \
+            >"$RUNNER_TEMP/td-current.json"
+          scripts/ecs/render-task-def.sh --env "$ENV" "$RUNNER_TEMP/td-current.json" "$IMAGE_REF" "$GIT_SHA" >"$RUNNER_TEMP/td.json"
+          echo "Rendered a new revision of ${FAMILY} for image ${IMAGE_DIGEST}"
+
+      - name: Register the task definition
+        run: |
+          set -euo pipefail
+          td_arn="$(aws ecs register-task-definition --cli-input-json "file://$RUNNER_TEMP/td.json" \
+            --query taskDefinition.taskDefinitionArn --output text)"
+          echo "TD_ARN=${td_arn}" >> "$GITHUB_ENV"
+          echo "Registered ${td_arn##*/}"
+
+      # Always with the revision ARN: Terraform ignores task_definition changes, and the deploy role may only
+      # update this service to a revision of this family.
+      - name: Update the service
+        run: |
+          set -euo pipefail
+          aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" --task-definition "$TD_ARN" \
+            --query "service.deployments[?status=='PRIMARY'].id" --output text >/dev/null
+          echo "Update started for ${TD_ARN##*/}"
+
+      # Not the AWS CLI stability waiter: it also succeeds after a circuit-breaker rollback (ADR 0005, Finding 2).
+      - name: Wait for the rollout
+        run: scripts/ecs/wait-deployment.sh "$CLUSTER" "$SERVICE" "$TD_ARN"
+
+      # configure-aws-credentials masks the assumed-role ARN in logs, so the summary shows the role name (the helper
+      # leaves the session name out: it carries the run ID). The Trivy result is in the build-scan job summary.
+      - name: Summary
+        if: always()
+        env:
+          ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          revision="not registered"
+          if [[ -n "${TD_ARN:-}" ]]; then
+            revision="${TD_ARN##*/}"
+          fi
+          role="$(scripts/names.sh role 2>/dev/null)" || role="not assumed"
+          {
+            echo "### app-deploy"
+            echo "Commit: \`${GIT_SHA}\`"
+            echo "Image digest: \`${IMAGE_DIGEST:-not pushed}\`"
+            echo "Task definition: \`${revision}\`"
+            echo "Result: ${JOB_STATUS}"
+            echo "Role: \`${role}\`"
+          } | scripts/aws/assert-no-account-id.sh >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove the image and task definition files
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/image" "$RUNNER_TEMP/td-current.json" "$RUNNER_TEMP/td.json"

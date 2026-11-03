@@ -1,0 +1,108 @@
+# The shared start of every Terraform job that holds AWS credentials (ADR 0008, P6): select the environment root,
+# install the checksum-verified tools, check the configuration, assume the role, init, and mask the ALB CIDRs.
+# Used by the reusable plan, the terraform-iac apply and the terraform-destroy jobs.
+#
+# The caller job keeps harden-runner as step 1 (with its own exact allowlist) and checks the repository out first: this
+# is a local action, so its files must be on disk before `uses: ./.github/actions/terraform-setup` can be resolved.
+# The caller also keeps its own plan, apply or destroy steps, and the `permissions:` (id-token: write) of the job.
+#
+# Secrets arrive as inputs: the runner masks a secret value wherever it appears, so an input holding the account ID or
+# the role ARN is masked in every log line, as it is in the workflow. This action reads no `secrets` or `vars` context.
+# The OIDC token claims (sub, job_workflow_ref) do not change inside a local action, so the role trust is unaffected.
+# `TF_DIR` goes to GITHUB_ENV and stays visible to the later steps of the calling job.
+name: terraform-setup
+description: Select the environment root, install tools, check the configuration, assume the role, init and mask the ALB CIDRs
+
+inputs:
+  env:
+    description: Environment name (a directory under infra/terraform/envs)
+    required: true
+  role-kind:
+    description: Which role to assume, plan or apply (the role is <prefix>-<env>-gha-<kind>, project.env)
+    required: true
+  role-arn:
+    description: ARN of that role
+    required: true
+  account-id:
+    description: AWS account ID of the environment
+    required: true
+  region:
+    description: AWS region
+    required: true
+  session-prefix:
+    description: Role session name prefix (plan, apply or destroy); the run ID and attempt are appended
+    required: true
+  alb-ingress-cidrs:
+    description: Optional JSON list of CIDRs allowed to reach the ALB (masked element by element)
+    required: false
+    default: ""
+  require-alb-ingress-cidrs:
+    description: "true makes an empty alb-ingress-cidrs fail (the apply fails closed); anything else leaves it optional"
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    # Validates the name (2 to 8 lowercase letters and digits) and that the root exists, before any credential is used.
+    # The substitution is assigned on its own line: inside `echo "TF_DIR=$(...)"` a failing script would not fail the
+    # step, and GITHUB_ENV would get an empty TF_DIR.
+    - name: Select the environment root
+      shell: bash
+      env:
+        ENV: ${{ inputs.env }}
+      # The value is validated by names.sh (a fixed pattern and an existing directory), so it cannot carry a newline or a
+      # second variable into GITHUB_ENV; zizmor cannot know that, hence the one narrow ignore.
+      run: | # zizmor: ignore[github-env]
+        tf_dir="$(scripts/names.sh env-root)"
+        echo "TF_DIR=${tf_dir}" >> "$GITHUB_ENV"
+
+    - name: Install Terraform and tflint (checksum verified)
+      shell: bash
+      run: scripts/ci/install-tools.sh "$RUNNER_TEMP/tools"
+
+    - name: Check configuration
+      shell: bash
+      env:
+        ENV: ${{ inputs.env }}
+        ROLE_KIND: ${{ inputs.role-kind }}
+        ROLE_ARN: ${{ inputs.role-arn }}
+        ACCOUNT: ${{ inputs.account-id }}
+        REGION: ${{ inputs.region }}
+      run: |
+        case "$ROLE_KIND" in plan | apply) ;; *) echo "::error::role-kind must be plan or apply"; exit 1 ;; esac
+        scripts/aws/check-config.sh "$ROLE_KIND"
+
+    # Optional secret: a JSON list of CIDRs allowed to reach the ALB. Each element is masked before Terraform can print
+    # it. The apply requires it (set it to ["0.0.0.0/0"] to open the ALB on purpose); this runs before the role is
+    # assumed, so a refusal costs no AWS call. The plan and the destroy leave it optional.
+    - name: Mask the ALB ingress CIDRs
+      shell: bash
+      env:
+        ENV: ${{ inputs.env }}
+        CIDRS: ${{ inputs.alb-ingress-cidrs }}
+        REQUIRE: ${{ inputs.require-alb-ingress-cidrs }}
+      run: |
+        if [[ "$REQUIRE" == "true" ]]; then
+          scripts/tf/mask-cidrs.sh --require
+        else
+          scripts/tf/mask-cidrs.sh
+        fi
+
+    - name: Assume the ${{ inputs.role-kind }} role
+      uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+      with:
+        role-to-assume: ${{ inputs.role-arn }}
+        aws-region: ${{ inputs.region }}
+        role-session-name: gha-${{ inputs.session-prefix }}-${{ github.run_id }}-${{ github.run_attempt }}
+        mask-aws-account-id: true
+        retry-max-attempts: 3
+
+    # tf/init.sh derives the state bucket name (ADR 0002, B8), so there is no bucket secret.
+    - name: Terraform init
+      shell: bash
+      env:
+        ENV: ${{ inputs.env }}
+        ACCOUNT: ${{ inputs.account-id }}
+        REGION: ${{ inputs.region }}
+      run: scripts/tf/init.sh

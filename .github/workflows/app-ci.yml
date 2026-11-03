@@ -1,0 +1,85 @@
+# App CI (PLAN Phase 4, ADR 0005, FR-10): build the image, run the tests (they run inside the image build), smoke
+# test it like Fargate and scan it. It never pushes and never touches AWS: no secrets, no OIDC token, no deployment environment,
+# so it also runs for fork and Dependabot pull requests. Not a required status check (path filtered, ADR 0005, Q5).
+name: App CI
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - app/**
+      - .github/workflows/app-ci.yml
+      - scripts/lib.sh
+      - project.env
+      - scripts/image/smoke.sh
+      - scripts/image/build.sh
+      - scripts/ci/requirements.txt
+      - scripts/ci/venv.sh
+      - scripts/ci/tools.sha256
+      - scripts/names.sh
+      - scripts/image/verify.sh
+      - scripts/ci/install-tools.sh
+      - scripts/image/scan.sh
+      - mise.toml
+
+permissions: {}
+
+# Nothing here holds AWS state, so a newer push to the same PR cancels the older run.
+concurrency:
+  group: app-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GIT_SHA: ${{ github.event.pull_request.head.sha }}
+
+jobs:
+  build-test-scan:
+    name: build, test, scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install trivy and hadolint (checksum verified)
+        run: scripts/ci/install-tools.sh "$RUNNER_TEMP/tools" trivy hadolint
+
+      - name: Lint the Dockerfile
+        run: hadolint app/Dockerfile
+
+      - name: Install pre-commit (hash locked)
+        run: |
+          scripts/ci/venv.sh "$RUNNER_TEMP/venv"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+
+      - name: Python checks (ruff and mypy)
+        run: |
+          pre-commit run ruff-check --all-files --show-diff-on-failure
+          pre-commit run ruff-format --all-files --show-diff-on-failure
+          pre-commit run mypy --all-files --show-diff-on-failure
+
+      # Build (the unit tests run inside, one platform, one digest), smoke test like Fargate, scan.
+      - name: Build, smoke test and scan the image
+        run: scripts/image/verify.sh "$GIT_SHA" "$RUNNER_TEMP/scan"
+
+      # The scan step writes the Trivy counts and database version to the job summary.
+      - name: Summary
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          {
+            echo "### app-ci"
+            echo "Commit: \`${GIT_SHA}\`"
+            echo "Result: ${JOB_STATUS}"
+            echo "The image was not pushed."
+          } >> "$GITHUB_STEP_SUMMARY"

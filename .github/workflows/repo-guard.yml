@@ -1,0 +1,63 @@
+# Repository guards that run on every pull request and every push to main, with no path filter (ADR 0004).
+# The file path is in the role trust (bootstrap `workflow_files`), and terraform-iac is path filtered, so a change
+# that touches only another workflow file would skip its checks. This workflow has no AWS access and no secrets.
+# This file must never be added to the bootstrap `workflow_files`.
+name: Repo Guard
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    name: guard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Hash-locked install (pre-commit and PyYAML); a commit made with --no-verify or in the web editor skips the
+      # local hooks.
+      - name: Install pre-commit and PyYAML (hash locked)
+        run: |
+          scripts/ci/venv.sh "$RUNNER_TEMP/venv"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+
+      - name: Workflow security audit (zizmor)
+        run: pre-commit run zizmor --all-files --show-diff-on-failure
+
+      - name: No bare 12-digit account ID in tracked files
+        run: pre-commit run no-aws-account-id --all-files --show-diff-on-failure
+
+      - name: Secret scan (gitleaks)
+        run: pre-commit run gitleaks --all-files --show-diff-on-failure
+
+      - name: Workflow trigger allowlist (every workflow file)
+        run: scripts/guard/workflow-triggers.sh
+
+      - name: Harden-runner policy (block where credentials live, audit elsewhere)
+        run: scripts/guard/harden-runner.sh
+
+      - name: Environment parity (every root is a copy of envs/dev, every workflow lists every env)
+        run: scripts/guard/env-parity.sh
+
+      - name: CI helper self-tests
+        run: scripts/ci/selftest.sh

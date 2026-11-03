@@ -1,0 +1,22 @@
+# terraform-docs settings for every Terraform root and module (ADR 0001, D16).
+# The terraform_docs pre-commit hook writes the generated tables between the BEGIN_TF_DOCS and END_TF_DOCS
+# markers in each README.md; the prose around the markers is written by hand.
+formatter: markdown table
+
+sections:
+  # Data sources (mostly aws_iam_policy_document) would bury the resource list; the header comes from README prose.
+  hide: [header, footer, data-sources]
+
+sort:
+  enabled: true
+  by: required
+
+settings:
+  anchor: false
+  default: true
+  escape: false
+  hide-empty: true
+  html: false
+  required: true
+  sensitive: true
+  type: true
