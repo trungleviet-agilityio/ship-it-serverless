@@ -68,7 +68,7 @@ Day to day, run everything through `make` (`make help` lists the targets):
 |---|---|
 | `make up` / `make down` | Run or stop the app on http://localhost:8080 (the Web Adapter is inert outside Lambda) |
 | `make test` | App unit tests, including SigV4 against AWS's published example |
-| `make lint` | pre-commit (gitleaks, zizmor, ruff, mypy, terraform hooks, account-ID guard), hadolint, shellcheck, actionlint, guards and CI helper self-tests |
+| `make lint` | pre-commit (gitleaks, zizmor, ruff, mypy, terraform hooks, account-ID guard), hadolint, shellcheck, actionlint, guards, CI helper self-tests and sis-team guard tests |
 | `make tf-check` | Offline Terraform policy rules, README check, `fmt`, `validate`, `terraform test` with mock providers |
 | `make verify` | Build the image the way CI does, smoke test it read-only as UID 10001, scan it with Trivy |
 | `make check` | Everything a PR must pass |
@@ -382,4 +382,6 @@ reference rates; check the ap-southeast-1 pages for
 ## Agent team (Claude Code plugin `sis-team`)
 
 The plugin in [`plugins/sis-team/`](plugins/sis-team/) comes from the template and still describes the ECS lab in
-places; updating it, `CLAUDE.md` and `.claude/skills/` is an open owner item (ADR 0012 Q-A).
+places; updating it, `CLAUDE.md` and `.claude/skills/` is an open owner item (ADR 0012 Q-A). Its guard hook blocks
+`terraform apply`/`destroy`, secret values, PR merges, workflow dispatch, `gh api` writes (such as approving a
+deployment), pushes to `main` and reads of secret files (ADR 0013).
