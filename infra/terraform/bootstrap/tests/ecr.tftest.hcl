@@ -80,14 +80,32 @@ run "lambda_pull_is_scoped_to_the_function" {
         length(s.condition) == 1
         && anytrue([
           for c in s.condition : (
-            c.test == "StringLike"
+            c.test == "ArnLike"
             && c.variable == "aws:sourceArn"
-            && toset(c.values) == toset(["arn:aws:lambda:ap-southeast-1:123456789012:function:sis-dev-app*"])
+            && toset(c.values) == toset([
+              "arn:aws:lambda:ap-southeast-1:123456789012:function:sis-dev-app",
+              "arn:aws:lambda:ap-southeast-1:123456789012:function:sis-dev-app:*",
+            ])
           )
         ])
       ) if s.sid == "LambdaPull"
     ])
-    error_message = "LambdaPull needs StringLike aws:sourceArn on this env's function (confused deputy protection)"
+    error_message = "LambdaPull needs ArnLike aws:sourceArn on exactly the function and its qualified ARNs (confused deputy protection)"
+  }
+
+  # L1 (review): no prefix wildcard, so a sibling function such as sis-dev-app2 cannot pull; and no
+  # aws:SourceAccount, which is not documented for this pull and would block every pull if Lambda did not send it.
+  assert {
+    condition = alltrue(flatten([
+      for s in data.aws_iam_policy_document.ecr_repository.statement : [
+        for c in s.condition : (
+          !contains(c.values, "arn:aws:lambda:ap-southeast-1:123456789012:function:sis-dev-app*")
+          && lower(c.variable) != "aws:sourceaccount"
+          && c.test != "StringLike"
+        )
+      ] if s.sid == "LambdaPull"
+    ]))
+    error_message = "LambdaPull must not use a function-name wildcard, StringLike or aws:SourceAccount"
   }
 
   assert {

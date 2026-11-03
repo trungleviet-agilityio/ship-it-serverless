@@ -13,14 +13,14 @@ images.
 
 | Area | Resources |
 |---|---|
-| Function (L1, L3) | `<prefix>-<env>-app`: package type `Image`, `x86_64`, `memory_mb` (512), `timeout_s` (10), `publish = true`, reserved concurrency only when `reserved_concurrency` is set. Env: `APP_ENV`, `AWS_LWA_PORT=8080`, `AWS_LWA_READINESS_CHECK_PATH=/health`, `APP_API_KEY_SECRET_ARN` (the ARN, never the value), `IMAGE_DIGEST` |
+| Function (L1, L3) | `<prefix>-<env>-app`: package type `Image`, `x86_64`, `memory_mb` (512), `timeout_s` (10), `publish = true`, reserved concurrency only when `reserved_concurrency` is set. Env: `APP_ENV`, `AWS_LWA_PORT=8080`, `AWS_LWA_READINESS_CHECK_PATH=/health`, `APP_API_KEY_SECRET_ARN` (the ARN, never the value; a precondition refuses an `APP_API_KEY` entry), `IMAGE_DIGEST`. Description seeded as `initial image (terraform create) <digest>`; App Deploy owns it afterwards |
 | Alias (L3, L7) | `live`, created on the version published at create; App Deploy moves it afterwards |
-| HTTP API (L2) | `<prefix>-<env>-api`: `AWS_PROXY` integration on the **alias ARN**, payload 2.0, one `$default` route, `$default` stage with auto-deploy, stage throttling (`api_throttle_rate_limit` 5/s, `api_throttle_burst_limit` 10) and a JSON access log (request ID, route, status, integration status, latency, source IP; never headers) |
+| HTTP API (L2) | `<prefix>-<env>-api`: `AWS_PROXY` integration (method `POST`) on the **alias ARN**, payload 2.0, one `$default` route, `$default` stage with auto-deploy, stage throttling (`api_throttle_rate_limit` 5/s, `api_throttle_burst_limit` 10) and a JSON access log (request ID, route, status, integration status, latency, source IP; never headers) |
 | Permission | `lambda:InvokeFunction` for `apigateway.amazonaws.com` on qualifier `live`, source ARN `<api execution ARN>/*/*` |
 | Logs (L10) | `/aws/lambda/<prefix>-<env>-app` and `/aws/apigateway/<prefix>-<env>-api`, `log_retention_days` (7) |
-| Alarms (L10) | `<prefix>-<env>-app-errors` and `-app-throttles` (Lambda, dimension `Resource = <function>:live`), `<prefix>-<env>-api-5xx` (HTTP API `5xx`, stage `$default`). 1-minute `Sum`, `notBreaching`; actions to `alarm_topic_arn` when set |
+| Alarms (L10) | `<prefix>-<env>-app-errors` and `-app-throttles` (Lambda, dimension `Resource = <function>:live`), `<prefix>-<env>-api-5xx` (HTTP API `5xx`, stage `$default`). 1-minute `Sum`, `notBreaching`; actions to `alarm_topic_arn` when set. Lambda `Errors` counts crashes and timeouts only: with the Web Adapter an app HTTP 500 is a successful invoke, so `api-5xx` is the alarm for app 500s. The alias metrics aggregate every version behind `live`, canary weights included |
 | Secret (FR-8) | `<prefix>/<env>/app-api-key`, a shell with **no value**. The module never creates a secret version |
-| IAM (L9) | Execution role `<prefix>-<env>-app-exec`: trusts `lambda.amazonaws.com` for this account only (`aws:SourceAccount`), carries the bootstrap boundary `<prefix>-<env>-app-boundary`; inline policy `logs:CreateLogStream`/`logs:PutLogEvents` on the function log group and `secretsmanager:GetSecretValue` on the one secret ARN. Not `AWSLambdaBasicExecutionRole` |
+| IAM (L9) | Execution role `<prefix>-<env>-app-exec`: trusts `lambda.amazonaws.com` with no condition (`aws:SourceAccount` is not documented for this trust and would fail closed; only this account's apply role can pass the role), carries the bootstrap boundary `<prefix>-<env>-app-boundary`; inline policy `logs:CreateLogStream`/`logs:PutLogEvents` on the function log group and `secretsmanager:GetSecretValue` on the one secret ARN, only from inside the function (`ArnEquals lambda:SourceFunctionArn` = the unqualified function ARN). Not `AWSLambdaBasicExecutionRole` |
 
 ## Usage
 
@@ -45,10 +45,15 @@ module "app_lambda" {
   images": run App Deploy once (it pushes, then stops green with a notice because the function does not exist yet),
   then apply.
 - **Who owns what (L3).** Terraform owns the function shape, the alias, the API, logs, alarms and the role. App
-  Deploy owns the image and the serving version: Terraform ignores `image_uri` and
-  `environment[0].variables["IMAGE_DIGEST"]` on the function, and `function_version` and `routing_config` on the
-  alias. `tests/iam_documents.tftest.hcl` proves that a newer ECR image plans no change to either, while other
+  Deploy owns the image, the description and the serving version: Terraform ignores `image_uri`,
+  `environment[0].variables["IMAGE_DIGEST"]` and `description` on the function, and `function_version` and
+  `routing_config` on the alias. The deploy writes the description (`sha=<sha> digest=<digest>`) with
+  `IMAGE_DIGEST` before `PublishVersion`, which publishes nothing new when code and configuration are unchanged.
+  `tests/iam_documents.tftest.hcl` proves that a newer ECR image plans no change to any of them, while other
   settings still apply.
+- **Re-create (accepted risk).** After a teardown and re-create the function starts on the newest pushed image,
+  which may be newer than the last release, until the next release: run a release with a known-green SHA right
+  after the apply.
 - **Versions.** `publish = true`, so a Terraform change to the function also publishes a version. That version gets
   no traffic: only App Deploy moves `live`.
 - **Timeouts.** `timeout_s` is at most 30 (HTTP API integration limit); the integration waits 29 s.

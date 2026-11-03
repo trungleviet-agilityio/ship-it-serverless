@@ -104,7 +104,7 @@ run "trust_is_lambda_only_without_conditions" {
         toset(s.actions),
         toset(flatten([for p in s.principals : p.type])),
         toset(flatten([for p in s.principals : p.identifiers])),
-        length(s.condition == null ? [] : s.condition),
+        length(s.condition),
       ]
       ] == [[
         "Allow",
@@ -151,7 +151,7 @@ run "secret_read_requires_the_source_function" {
   assert {
     condition = {
       for s in data.aws_iam_policy_document.exec.statement : s.sid => [
-        for c in(s.condition == null ? [] : s.condition) : [c.test, c.variable, toset(c.values)]
+        for c in s.condition : [c.test, c.variable, toset(c.values)]
       ]
       } == {
       LogsWriteOneGroup = []

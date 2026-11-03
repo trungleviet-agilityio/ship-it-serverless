@@ -178,6 +178,15 @@ run "deploy_scope" {
     error_message = "deploy ECR push resources must be exactly the one repository"
   }
 
+  # B2: UpdateFunctionCode with an image needs ecr:GetRepositoryPolicy on the caller; read only, never Set.
+  assert {
+    condition = alltrue([
+      for s in data.aws_iam_policy_document.deploy.statement : contains(s.actions, "ecr:GetRepositoryPolicy")
+      if s.sid == "EcrPushOneRepo"
+    ])
+    error_message = "the deploy role reads the policy of its one repository (UpdateFunctionCode with an image)"
+  }
+
   assert {
     condition = alltrue([
       for s in data.aws_iam_policy_document.deploy.statement : !anytrue([for a in s.actions : startswith(a, "s3:")])
@@ -404,6 +413,42 @@ run "deploy_lambda_scope" {
   }
 }
 
+# L2 (review): AddPermission only for API Gateway (lambda:Principal), in its own statement, so the apply role can
+# never grant invoke to another account, another service or the public.
+run "apply_add_permission_is_api_gateway_only" {
+  command = plan
+
+  assert {
+    condition = [
+      for s in data.aws_iam_policy_document.apply.statement : [
+        s.sid,
+        s.effect,
+        toset(s.actions),
+        toset(s.resources),
+        [for c in s.condition : [c.test, c.variable, toset(c.values)]],
+      ] if contains(s.actions, "lambda:AddPermission")
+      ] == [[
+        "LambdaAddPermissionApiGateway",
+        "Allow",
+        toset(["lambda:AddPermission"]),
+        toset([
+          "arn:aws:lambda:ap-southeast-1:123456789012:function:sis-dev-*",
+          "arn:aws:lambda:ap-southeast-1:123456789012:function:sis-dev-*:*",
+        ]),
+        [["StringEquals", "lambda:Principal", toset(["apigateway.amazonaws.com"])]],
+    ]]
+    error_message = "lambda:AddPermission must be alone in one statement with StringEquals lambda:Principal = apigateway.amazonaws.com"
+  }
+
+  # B2: the provider may read the recursion config on refresh; read only, on this env's functions.
+  assert {
+    condition = contains(flatten([
+      for s in data.aws_iam_policy_document.apply.statement : tolist(s.actions) if s.sid == "LambdaFunction"
+    ]), "lambda:GetFunctionRecursionConfig")
+    error_message = "the apply role may read the function recursion config"
+  }
+}
+
 run "apply_lambda_and_front_door_scope" {
   command = plan
 
@@ -421,8 +466,8 @@ run "apply_lambda_and_front_door_scope" {
     condition = alltrue([
       for a in [
         "lambda:CreateFunction", "lambda:DeleteFunction", "lambda:GetFunction", "lambda:UpdateFunctionConfiguration",
-        "lambda:PublishVersion", "lambda:CreateAlias", "lambda:UpdateAlias", "lambda:AddPermission",
-        "lambda:RemovePermission", "lambda:GetPolicy", "lambda:PutFunctionConcurrency", "lambda:DeleteFunctionConcurrency",
+        "lambda:PublishVersion", "lambda:CreateAlias", "lambda:UpdateAlias",
+        "lambda:RemovePermission", "lambda:GetFunctionRecursionConfig", "lambda:GetPolicy", "lambda:PutFunctionConcurrency", "lambda:DeleteFunctionConcurrency",
         "lambda:TagResource", "lambda:ListTags",
       ] : contains(flatten([for s in data.aws_iam_policy_document.apply.statement : tolist(s.actions) if s.sid == "LambdaFunction"]), a)
     ])
@@ -471,7 +516,8 @@ run "apply_lambda_and_front_door_scope" {
   }
 }
 
-# ADR 0012 L4: the repository and its policy are bootstrap's. The apply role reads the one repository only.
+# ADR 0012 L4: the repository and its policy are bootstrap's. The apply role reads the one repository only: the
+# data source, plus what CreateFunction and UpdateFunctionCode with an image need on the caller (B2).
 run "apply_ecr_read_only" {
   command = plan
 
@@ -480,10 +526,16 @@ run "apply_ecr_read_only" {
       for s in data.aws_iam_policy_document.apply.statement : [toset(s.actions), toset(s.resources)]
       if anytrue([for a in s.actions : startswith(a, "ecr:")])
       ] == [[
-        toset(["ecr:DescribeImages", "ecr:DescribeRepositories"]),
+        toset([
+          "ecr:DescribeImages",
+          "ecr:DescribeRepositories",
+          "ecr:BatchGetImage",
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:GetRepositoryPolicy",
+        ]),
         toset(["arn:aws:ecr:ap-southeast-1:123456789012:repository/sis-dev-app"]),
     ]]
-    error_message = "the apply role may only describe the one repository (no create, delete, push or policy write)"
+    error_message = "the apply role may only read the one repository (no create, delete, push or policy write)"
   }
 
   assert {
@@ -514,10 +566,10 @@ run "apply_iam_requires_boundary" {
     error_message = "iam:CreateRole needs the boundary condition"
   }
 
-  # Per the IAM Service Authorization Reference all six actions support iam:PermissionsBoundary.
+  # Per the IAM Service Authorization Reference these four support iam:PermissionsBoundary.
   assert {
     condition = alltrue([
-      for a in ["iam:CreateRole", "iam:PutRolePolicy", "iam:DeleteRolePolicy", "iam:PutRolePermissionsBoundary", "iam:UpdateAssumeRolePolicy", "iam:DeleteRole"] :
+      for a in ["iam:CreateRole", "iam:PutRolePolicy", "iam:DeleteRolePolicy", "iam:PutRolePermissionsBoundary"] :
       anytrue([
         for s in data.aws_iam_policy_document.apply.statement : (
           contains(s.actions, a)
@@ -527,6 +579,47 @@ run "apply_iam_requires_boundary" {
       ])
     ])
     error_message = "every mutating IAM role action must sit under the boundary condition on exactly the execution role ARN"
+  }
+
+  # L3 (review): the condition only sits on actions that support the key. On any other action it would not
+  # constrain anything; it would only deny the action (the key is absent from the request).
+  assert {
+    condition = alltrue(flatten([
+      for s in data.aws_iam_policy_document.apply.statement : [
+        for a in s.actions : contains([
+          "iam:CreateRole",
+          "iam:PutRolePolicy",
+          "iam:DeleteRolePolicy",
+          "iam:PutRolePermissionsBoundary",
+          "iam:AttachRolePolicy",
+          "iam:DetachRolePolicy",
+          "iam:DeleteRolePermissionsBoundary",
+        ], a)
+      ] if s.effect == "Allow" && anytrue([for c in s.condition : c.variable == "iam:PermissionsBoundary"])
+    ]))
+    error_message = "iam:PermissionsBoundary conditions may only sit on actions that support the key"
+  }
+
+  # Trust change and delete (no iam:PermissionsBoundary support) and the metadata writes: exact role ARN, no
+  # condition, and the metadata statement never claims to be a read.
+  assert {
+    condition = {
+      for s in data.aws_iam_policy_document.apply.statement : s.sid => [
+        s.effect, toset(s.actions), toset(s.resources), length(s.condition)
+      ] if contains(["IamAppRoleTrustAndDelete", "IamAppRoleMetadata", "IamAppRoleRead"], s.sid)
+      } == {
+      IamAppRoleTrustAndDelete = ["Allow", toset(["iam:UpdateAssumeRolePolicy", "iam:DeleteRole"]), toset(["arn:aws:iam::123456789012:role/sis-dev-app-exec"]), 0]
+      IamAppRoleMetadata       = ["Allow", toset(["iam:TagRole", "iam:UntagRole", "iam:UpdateRole", "iam:UpdateRoleDescription"]), toset(["arn:aws:iam::123456789012:role/sis-dev-app-exec"]), 0]
+      IamAppRoleRead = ["Allow", toset([
+        "iam:GetRole",
+        "iam:GetRolePolicy",
+        "iam:ListRolePolicies",
+        "iam:ListAttachedRolePolicies",
+        "iam:ListInstanceProfilesForRole",
+        "iam:ListRoleTags",
+      ]), toset(["arn:aws:iam::123456789012:role/sis-dev-app-exec"]), 0]
+    }
+    error_message = "trust/delete, metadata and read statements: exact execution role ARN, no condition, reads only in IamAppRoleRead"
   }
 
   # No IAM write or read on roles may target a wildcard role pattern (M1).
@@ -541,7 +634,7 @@ run "apply_iam_requires_boundary" {
   assert {
     condition = alltrue([
       for s in data.aws_iam_policy_document.apply.statement : toset(s.resources) == toset(["arn:aws:iam::123456789012:role/sis-dev-app-exec"])
-      if contains(["IamAppRoleBounded", "IamAppRoleRead", "PassAppExecRole"], s.sid)
+      if contains(["IamAppRoleBounded", "IamAppRoleTrustAndDelete", "IamAppRoleMetadata", "IamAppRoleRead", "PassAppExecRole"], s.sid)
     ])
     error_message = "app role statements must target exactly sis-dev-app-exec"
   }
@@ -636,6 +729,20 @@ run "boundary_contents" {
       AppSecretRead = ["Allow", toset(["secretsmanager:GetSecretValue"]), toset(["arn:aws:secretsmanager:ap-southeast-1:123456789012:secret:sis/dev/*"])]
     }
     error_message = "the boundary allows only log writes to /aws/lambda/sis-dev-* and reading sis/dev secrets"
+  }
+
+  # M3a (review): the secret read only works from inside the env's function (unqualified ARN, ArnEquals), so a role
+  # given a foreign trust still cannot read it. The log statement has no condition.
+  assert {
+    condition = {
+      for s in data.aws_iam_policy_document.app_boundary.statement : s.sid => [
+        for c in s.condition : [c.test, c.variable, toset(c.values)]
+      ]
+      } == {
+      LambdaLogsWrite = []
+      AppSecretRead   = [["ArnEquals", "lambda:SourceFunctionArn", toset(["arn:aws:lambda:ap-southeast-1:123456789012:function:sis-dev-app"])]]
+    }
+    error_message = "AppSecretRead needs ArnEquals lambda:SourceFunctionArn = the unqualified function ARN"
   }
 }
 

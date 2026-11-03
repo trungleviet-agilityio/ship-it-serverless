@@ -41,6 +41,9 @@ data "aws_iam_policy_document" "apply" {
   # Function, alias, permission, concurrency and tags (L3), as the aws provider calls them for aws_lambda_function,
   # aws_lambda_alias and aws_lambda_permission. Scoped to this env's functions and their qualified ARNs.
   # UpdateFunctionCode stays: architectures is set through it, even though Terraform ignores image_uri.
+  # GetFunctionRecursionConfig is defensive: the provider may read it on refresh; read only, same scope.
+  # RemovePermission stays here without the lambda:Principal condition of LambdaAddPermissionApiGateway: removing
+  # a permission can only narrow who may invoke, and a condition key the request lacked would block a destroy.
   statement {
     sid    = "LambdaFunction"
     effect = "Allow"
@@ -50,6 +53,7 @@ data "aws_iam_policy_document" "apply" {
       "lambda:GetFunction",
       "lambda:GetFunctionConfiguration",
       "lambda:GetFunctionCodeSigningConfig",
+      "lambda:GetFunctionRecursionConfig",
       "lambda:GetRuntimeManagementConfig",
       "lambda:UpdateFunctionCode",
       "lambda:UpdateFunctionConfiguration",
@@ -59,7 +63,6 @@ data "aws_iam_policy_document" "apply" {
       "lambda:DeleteAlias",
       "lambda:GetAlias",
       "lambda:UpdateAlias",
-      "lambda:AddPermission",
       "lambda:RemovePermission",
       "lambda:GetPolicy",
       "lambda:PutFunctionConcurrency",
@@ -72,12 +75,39 @@ data "aws_iam_policy_document" "apply" {
     resources = local.function_arns_env
   }
 
-  # data "aws_ecr_image" (most_recent) picks the first image of the one repository (L3). Read only: the repository
-  # and its policy belong to bootstrap (L4).
+  # The only resource-based permission the module adds is the HTTP API's (aws_lambda_permission.api). AddPermission
+  # supports the lambda:Principal condition key (Service Authorization Reference, AWS Lambda), so the apply role can
+  # never grant invoke to another account or service, or create a public Function URL permission.
   statement {
-    sid       = "EcrReadOneRepo"
+    sid       = "LambdaAddPermissionApiGateway"
     effect    = "Allow"
-    actions   = ["ecr:DescribeImages", "ecr:DescribeRepositories"]
+    actions   = ["lambda:AddPermission"]
+    resources = local.function_arns_env
+
+    condition {
+      test     = "StringEquals"
+      variable = "lambda:Principal"
+      values   = ["apigateway.amazonaws.com"]
+    }
+  }
+
+  # The one repository, read only; the repository and its policy belong to bootstrap (L4).
+  # - DescribeImages, DescribeRepositories: data "aws_ecr_image" (most_recent) finds the newest image (L3).
+  # - BatchGetImage, GetDownloadUrlForLayer, GetRepositoryPolicy: CreateFunction and UpdateFunctionCode with an
+  #   image need them on the caller (Lambda Developer Guide, "Create a function using a container image").
+  # The same page lists ecr:SetRepositoryPolicy, which exists so Lambda can add its own pull statement to the
+  # repository policy. It is not granted: bootstrap owns the policy and LambdaPull (ecr.tf) already allows
+  # lambda.amazonaws.com. The live checkpoint confirms that CreateFunction works without it.
+  statement {
+    sid    = "EcrReadOneRepo"
+    effect = "Allow"
+    actions = [
+      "ecr:DescribeImages",
+      "ecr:DescribeRepositories",
+      "ecr:BatchGetImage",
+      "ecr:GetDownloadUrlForLayer",
+      "ecr:GetRepositoryPolicy",
+    ]
     resources = [local.ecr_repo_app]
   }
 
@@ -120,8 +150,10 @@ data "aws_iam_policy_document" "apply" {
 
   # API Gateway HTTP API access logging permissions: the caller that sets access_log_settings on a stage needs the
   # CloudWatch Logs vended-delivery actions. CreateLogDelivery, GetLogDelivery, UpdateLogDelivery,
-  # DeleteLogDelivery, ListLogDeliveries, PutResourcePolicy, DescribeResourcePolicies and DescribeLogGroups support
-  # no resource-level permissions (Service Authorization Reference), so they take "*".
+  # DeleteLogDelivery, ListLogDeliveries, PutResourcePolicy, DescribeResourcePolicies and DescribeLogGroups are
+  # believed to support no resource-level permissions, so they take "*". Accepted risk: the Service Authorization
+  # Reference could not be opened offline to confirm the resource types; re-check it at the live checkpoint and
+  # scope any action that does support a resource (PutResourcePolicy can widen log group access account-wide).
   statement {
     sid    = "LogsDeliveryUnscoped"
     effect = "Allow"
@@ -153,7 +185,10 @@ data "aws_iam_policy_document" "apply" {
     resources = ["${local.svc_arn["cloudwatch"]}:alarm:${local.name}-*"]
   }
 
-  # Secret shells only: G1 denies reading or writing values.
+  # Secret shells only. Guardrail G1 denies reading values (GetSecretValue, BatchGetSecretValue) and PutSecretValue,
+  # but CreateSecret and UpdateSecret accept SecretString, so this role could still write a value through them.
+  # Accepted risk (ADR 0002 R1): the module never sets one (no secret version resource, tf/policy.sh rule 1), and a
+  # value written this way could not be read back by any CI role.
   statement {
     sid    = "SecretShell"
     effect = "Allow"
@@ -169,8 +204,15 @@ data "aws_iam_policy_document" "apply" {
     resources = [local.secret_pattern]
   }
 
-  # The execution role can only be created or changed with the boundary attached (B15, L9). Exact ARN, not a
-  # <name>-app-* pattern: the module creates one role, and a wildcard role pattern fails the M1 test.
+  # IAM on the execution role, exact ARN only (not a <name>-app-* pattern: the module creates one role, and a
+  # wildcard role pattern fails the M1 test). Each condition sits only on actions that support its key: an action
+  # without iam:PermissionsBoundary in its request context would never match a StringEquals on it and would be
+  # implicitly denied.
+
+  # The role can only be created or given policies with the boundary attached (B15, L9). Per the IAM Service
+  # Authorization Reference, iam:PermissionsBoundary is supported by CreateRole, PutRolePolicy, DeleteRolePolicy,
+  # PutRolePermissionsBoundary (and AttachRolePolicy, DetachRolePolicy, DeleteRolePermissionsBoundary, which this
+  # role does not hold or is denied).
   statement {
     sid    = "IamAppRoleBounded"
     effect = "Allow"
@@ -179,8 +221,6 @@ data "aws_iam_policy_document" "apply" {
       "iam:PutRolePolicy",
       "iam:DeleteRolePolicy",
       "iam:PutRolePermissionsBoundary",
-      "iam:UpdateAssumeRolePolicy",
-      "iam:DeleteRole",
     ]
     resources = [local.app_exec_role_arn]
 
@@ -189,6 +229,36 @@ data "aws_iam_policy_document" "apply" {
       variable = "iam:PermissionsBoundary"
       values   = [local.boundary_arn]
     }
+  }
+
+  # Trust change and delete. Neither supports iam:PermissionsBoundary (not in the reference's list above; re-check
+  # at the live checkpoint), so a boundary condition here would not constrain them, it would only deny them.
+  # UpdateAssumeRolePolicy could give the role a foreign trust: the boundary still caps the role, and its secret
+  # read requires lambda:SourceFunctionArn of this env's function (iam_app_boundary.tf), which a request from
+  # outside the function never carries. DeleteRole only removes the role; DenyBoundaryRemoval stays in force.
+  statement {
+    sid    = "IamAppRoleTrustAndDelete"
+    effect = "Allow"
+    actions = [
+      "iam:UpdateAssumeRolePolicy",
+      "iam:DeleteRole",
+    ]
+    resources = [local.app_exec_role_arn]
+  }
+
+  # Tags, description and maximum session duration. TagRole, UntagRole, UpdateRole and UpdateRoleDescription do not
+  # support iam:PermissionsBoundary either. None of them can widen what the role may do, and the boundary still caps
+  # the role whatever its tags or description say.
+  statement {
+    sid    = "IamAppRoleMetadata"
+    effect = "Allow"
+    actions = [
+      "iam:TagRole",
+      "iam:UntagRole",
+      "iam:UpdateRole",
+      "iam:UpdateRoleDescription",
+    ]
+    resources = [local.app_exec_role_arn]
   }
 
   statement {
@@ -201,10 +271,6 @@ data "aws_iam_policy_document" "apply" {
       "iam:ListAttachedRolePolicies",
       "iam:ListInstanceProfilesForRole",
       "iam:ListRoleTags",
-      "iam:TagRole",
-      "iam:UntagRole",
-      "iam:UpdateRole",
-      "iam:UpdateRoleDescription",
     ]
     resources = [local.app_exec_role_arn]
   }
