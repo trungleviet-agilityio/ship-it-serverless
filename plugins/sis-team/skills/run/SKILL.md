@@ -1,7 +1,8 @@
 ---
 name: run
-description: Build and verify one phase of the ship-it-safely lab with the sis-team agents - build agents in parallel worktrees, merge, update docs, then verify agents in parallel, then stop at the checkpoint. Use as /sis-team:run <phase>.
+description: Build and verify one phase of the ship-it-serverless lab with the sis-team agents - build agents in parallel worktrees, merge, update docs, then verify agents in parallel, then stop at the checkpoint. Use as /sis-team:run <phase>.
 argument-hint: <phase number>
+disable-model-invocation: true
 ---
 
 # /sis-team:run

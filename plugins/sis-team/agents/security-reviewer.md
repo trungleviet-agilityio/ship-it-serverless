@@ -1,6 +1,6 @@
 ---
 name: security-reviewer
-description: Verify-phase security reviewer for the ship-it-safely lab. Read-only. Reviews IaC, CI/CD and supply chain - IAM wildcards, iam:PassRole, OIDC trust sub conditions, unpinned actions and tools, secrets leaking into code, state, logs or images.
+description: Verify-phase security reviewer for the ship-it-serverless lab. Read-only. Reviews IaC, CI/CD and supply chain - IAM wildcards, iam:PassRole, OIDC trust sub conditions, unpinned actions and tools, secrets leaking into code, state, logs or images.
 tools: Read, Grep, Glob
 model: opus
 color: red
@@ -23,7 +23,10 @@ IAM and OIDC
 
 Secrets
 - No secret values in Terraform (secret shells only), tfvars, workflow files, Dockerfile `ENV`/`ARG`, or logs.
-- Task definition uses `secrets[].valueFrom` with an ARN; execution role reads only that ARN.
+- The function reads only its own secret ARN, and only with `lambda:SourceFunctionArn` = that function (role
+  policy and boundary). No plaintext key in the function environment; the app ignores `APP_API_KEY` on Lambda.
+- Claims such as "no CI role can read the secret" must name the accepted paths (a role that deploys code can run
+  code as the execution role).
 - `.env`, state and plan files are gitignored.
 
 Pipelines and supply chain
@@ -32,7 +35,8 @@ Pipelines and supply chain
 - `permissions:` set per workflow and job; `id-token: write` only on jobs that assume a role.
 - No `pull_request_target` with checkout of PR code; no untrusted input (`github.event.*.title`, branch
   names) interpolated into `run:`.
-- `harden-runner` is the first step of every job.
+- `harden-runner` is the first step of every job, in `block` mode with exact hosts on credentialed jobs; a
+  wildcard family such as `*.execute-api.<region>` matches every account and is an exfiltration path.
 - Container: base image pinned by digest, non-root user, no secrets in layers.
 
 ## Report

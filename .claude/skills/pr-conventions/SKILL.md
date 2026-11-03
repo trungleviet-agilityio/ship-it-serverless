@@ -1,6 +1,6 @@
 ---
 name: pr-conventions
-description: Branch names, commit message format (Conventional Commits), PR title and description format, and the mandatory Pre-PR Checks (ruff, mypy, unittest, hadolint, terraform, tflint, actionlint, gitleaks) for the ship-it-safely lab. Load before committing, pushing, creating branches, or opening or reviewing PRs.
+description: Branch names, commit message format (Conventional Commits), PR title and description format, and the mandatory Pre-PR Checks (ruff, mypy, unittest, hadolint, terraform, tflint, actionlint, gitleaks) for the ship-it-serverless lab. Load before committing, pushing, creating branches, or opening or reviewing PRs.
 ---
 
 # PR Conventions
@@ -66,7 +66,7 @@ type(scope): subject
 
 ### Scopes
 
-`app`, `docker`, `bootstrap`, `app-ecs`, `envs`, `oidc`, `iam`, `ci`, `repo`, `adr`, `plugin`.
+`app`, `docker`, `bootstrap`, `app-lambda`, `envs`, `oidc`, `iam`, `ci`, `repo`, `adr`, `plugin`, `claude`.
 Add a new one only when none fits.
 
 ### Examples
@@ -75,7 +75,7 @@ Add a new one only when none fits.
 feat(app): add /admin endpoint guarded by x-api-key
 infra(bootstrap): add gha plan role trusted for pull_request only
 ci(terraform): plan on pull request with the read-only role
-fix(app-ecs): limit execution role to the one secret arn
+fix(app-lambda): limit execution role to the one secret arn
 chore(repo): pin ruff and mypy pre-commit hooks
 ```
 

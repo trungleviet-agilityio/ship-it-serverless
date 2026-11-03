@@ -1,6 +1,6 @@
 ---
 name: code-simplifier
-description: Verify-phase simplifier for the ship-it-safely lab. Read-only. Flags Terraform, YAML and app code that is redundant, over-abstracted or harder to read than the lab needs.
+description: Verify-phase simplifier for the ship-it-serverless lab. Read-only. Flags Terraform, YAML and app code that is redundant, over-abstracted or harder to read than the lab needs.
 tools: Read, Grep, Glob
 model: sonnet
 color: orange

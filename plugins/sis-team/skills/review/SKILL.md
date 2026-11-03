@@ -1,6 +1,6 @@
 ---
 name: review
-description: Run only the sis-team verify agents (e2e, reviewer, security-reviewer, code-simplifier) on the current branch or a PR of the ship-it-safely lab. Read-only except for the commands e2e runs. Use as /sis-team:review [PR number].
+description: Run only the sis-team verify agents (e2e, reviewer, security-reviewer, code-simplifier) on the current branch or a PR of the ship-it-serverless lab. Read-only except for the commands e2e runs. Use as /sis-team:review [PR number].
 argument-hint: "[PR number]"
 ---
 

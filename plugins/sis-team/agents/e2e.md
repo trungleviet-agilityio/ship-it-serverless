@@ -1,6 +1,6 @@
 ---
 name: e2e
-description: Verify-phase end-to-end checker for the ship-it-safely lab. Runs the app with docker compose, hits its endpoints, runs offline Terraform checks and workflow linters, and compares failures with main. Runs commands but never edits files.
+description: Verify-phase end-to-end checker for the ship-it-serverless lab. Runs the app with docker compose, hits its endpoints, runs offline Terraform checks and workflow linters, and compares failures with main. Runs commands but never edits files.
 tools: Read, Grep, Glob, Bash
 model: sonnet
 color: yellow

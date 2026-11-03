@@ -1,6 +1,6 @@
 ---
 name: checkpoint-commands
-description: How to write the commands the user runs by hand at a ship-it-safely checkpoint (terraform apply and destroy, secret values, SSO, GitHub settings, workflow dispatches, teardown checks). Load before printing any command for the user to run, in chat, an ADR checkpoint section or a PR description.
+description: How to write the commands the user runs by hand at a ship-it-serverless checkpoint (terraform apply and destroy, secret values, SSO, GitHub settings, workflow dispatches, teardown checks). Load before printing any command for the user to run, in chat, an ADR checkpoint section or a PR description.
 ---
 
 # Checkpoint commands
@@ -13,7 +13,7 @@ failure in the lessons log; follow all of them.
 
 - One command per fenced `bash` block, then a line `Expect: ...` with the exact output or count to compare.
 - **Self-contained:** each command works in a fresh zsh. Put the profile and region inline
-  (`AWS_PROFILE=sis-dev-admin AWS_REGION=ap-southeast-1 aws ...`). Never rely on an earlier `export`, `cd` or
+  (`AWS_PROFILE=sls-dev-admin AWS_REGION=ap-southeast-1 aws ...`). Never rely on an earlier `export`, `cd` or
   shell variable.
 - Paths are relative to the repo root and use `terraform -chdir=...`. Say "from the repo root" once.
 - Never pack several arguments into one shell variable (zsh does not word-split). Use env vars or write them out.
@@ -31,10 +31,15 @@ failure in the lessons log; follow all of them.
 ## Order and waits
 
 - Start with `aws sso login --profile <profile>` when the step needs the admin profile.
-- The stack order is always: `terraform-iac` apply, then the secret value, then approve `app-deploy`.
-  When a merge starts both workflows, say to approve **only** the apply first.
+- A new env, in order (ADR 0012 L3): `app-deploy` pushes the first image and stops green ("function does not
+  exist yet"), then the `terraform-iac` apply creates the function from it, then the secret value, then approve
+  the next `app-deploy`. When a merge starts both workflows, say which one to approve first.
+- A re-created env serves the newest image in ECR until a release: right after the apply, release a known-green
+  SHA (dev `mode: rollback`, prod `app-promote`).
 - Before merging an infra PR during a teardown window, say that the merge starts an apply to reject.
-- Long waits (`aws ecs wait`, `--watch`) go in the user's own terminal, not a `!` command.
+- Long waits (`aws lambda wait function-updated-v2`, `--watch`) go in the user's own terminal, not a `!` command.
+- Every first apply of a new role or module ends with an AccessDenied check (CloudTrail `LookupEvents` for the
+  role); mock providers cannot find missing IAM read actions.
 - When a shared trust or IAM local changes, update the expected plan counts in `Expect:`.
 
 ## GitHub
@@ -47,10 +52,10 @@ failure in the lessons log; follow all of them.
 
 ## Teardown checks
 
-Prove deletion per service, never with the Resource Groups Tagging API (it lags and keeps INACTIVE task
-definitions). Give one command each for: `ec2 describe-vpcs` (by `tag:Project`), `elbv2 describe-load-balancers`
-(expect `LoadBalancerNotFound`), `ecs describe-clusters`, `ecr describe-repositories`,
-`secretsmanager list-secrets`, and `ecs list-task-definitions --status ACTIVE` (expect empty).
+Prove deletion per service, never with the Resource Groups Tagging API (it lags). Give one command each for:
+`lambda get-function` (expect `ResourceNotFoundException`), `apigatewayv2 get-apis` filtered by name (expect
+empty), `secretsmanager list-secrets` filtered by `sls/<env>/` (expect empty) and `logs describe-log-groups` for
+`/aws/lambda/sls-<env>-app` and `/aws/apigateway/sls-<env>-api`. ECR stays with the bootstrap until the lab ends.
 
 ## Writing them
 
