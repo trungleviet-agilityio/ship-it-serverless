@@ -18,7 +18,7 @@ fixture() {
   local d="$tmp_root/$1"
   mkdir -p "$d/modules/m" "$d/envs/dev"
   cat >"$d/modules/m/main.tf" <<'EOF'
-# comments may mention aws_secretsmanager_secret_version, AmazonECSTaskExecutionRolePolicy and provisioner "x" {
+# comments may mention aws_secretsmanager_secret_version, AWSLambdaBasicExecutionRole and provisioner "x" {
 resource "aws_iam_role" "ok" {
   name                 = "x"
   permissions_boundary = "arn"
@@ -70,7 +70,7 @@ good() {
 }
 
 d="$(fixture good)"
-printf 'data "aws_iam_policy_document" "t" {\n  statement {\n    principals {\n      type        = "Service"\n      identifiers = ["ecs-tasks.amazonaws.com"]\n    }\n  }\n}\n' >"$d/modules/m/trust.tf"
+printf 'data "aws_iam_policy_document" "t" {\n  statement {\n    principals {\n      type        = "Service"\n      identifiers = ["lambda.amazonaws.com"]\n    }\n  }\n}\n' >"$d/modules/m/trust.tf"
 printf 'output "name" {\n  # comments may mention module.x.role_arn and account_id\n  value = module.m.name\n}\n' >"$d/envs/dev/outputs.tf"
 "$policy" "$d" >/dev/null 2>&1 || die "good fixture must pass"
 ok "good fixture passes"
@@ -86,7 +86,9 @@ bad r2a 2 modules/m/sg.tf 'resource "aws_security_group_rule" "r" {}'
 bad r2b 2 modules/m/sg.tf 'resource "aws_security_group" "s" {\n  ingress {\n  }\n}'
 bad r2c 2 modules/m/sg.tf 'resource "aws_security_group" "s" {\n  dynamic "ingress" {\n  }\n}'
 bad r2d 2 modules/m/sg.tf 'resource "aws_security_group" "s" {\n  egress = [\n  ]\n}'
-bad r3a 3 modules/m/p.tf 'locals { p = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy" }'
+bad r3a 3 modules/m/p.tf 'locals { p = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole" }'
+bad r3c 3 modules/m/p.tf 'locals { p = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole" }'
+bad r3d 3 modules/m/p.tf 'locals { p = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy" }'
 bad r3b 3 modules/m/p.tf 'resource "aws_iam_role_policy_attachment" "a" {}'
 bad r4 4 modules/m/role.tf 'resource "aws_iam_role" "bad" {\n  name = "y"\n}'
 
@@ -110,9 +112,10 @@ bad r7c 7 modules/m/trust.tf 'locals {\n  trust = { Principal = { AWS = "x" } }\
 bad r7d 7 modules/m/trust.tf 'locals {\n  trust = { Principal = "*" }\n}'
 bad r7e 7 modules/m/trust.tf 'data "aws_iam_policy_document" "t" {\n  statement {\n    principals {\n      type = "*"\n      identifiers = ["*"]\n    }\n  }\n}'
 bad r7f 7 modules/m/trust.tf 'locals {\n  trust = { Federated = "x" }\n}'
-# ADR 0008 P9: only the promotion line, only in ecr.tf, is exempt.
+# No exemption is left under modules/ (the promotion pull moved to bootstrap/ecr.tf, ADR 0012 L4): the old line fails
+# in a module ecr.tf too.
 # shellcheck disable=SC2016  # HCL text
-bad r7g 7 modules/m/ecr.tf 'locals {\n  p = { Principal = { AWS = "arn:${local.partition}:iam::${var.other_account_id}:root" } }\n}'
+bad r7g 7 modules/m/ecr.tf 'locals {\n  p = { Principal = { AWS = "arn:${local.partition}:iam::${var.promotion_target_account_id}:root" } }\n}'
 # shellcheck disable=SC2016  # HCL text
 bad r7h 7 modules/m/trust.tf 'locals {\n  p = { Principal = { AWS = "arn:${local.partition}:iam::${var.promotion_target_account_id}:root" } }\n}'
 
@@ -155,10 +158,11 @@ bad r12b 12 bootstrap/versions.tf 'terraform {\n  required_providers {\n    aws 
 bad r12c 12 modules/m/versions.tf 'terraform {\n  required_providers {\n    note = "}"\n    aws = {\n      source = "example/aws"\n    }\n  }\n}'
 
 # These must pass: local sources, hashicorp providers, and a source outside a module or provider block.
-good g11 envs/dev/mod.tf 'module "x" { source = "../../modules/app-ecs" }\nmodule "y" {\n  source = "./y"\n}'
+good g11 envs/dev/mod.tf 'module "x" { source = "../../modules/app-lambda" }\nmodule "y" {\n  source = "./y"\n}'
 good g12 bootstrap/versions.tf 'terraform {\n  required_providers {\n    aws = {\n      source = "hashicorp/aws"\n    }\n  }\n}'
+# Bootstrap is outside rule 7: its ECR repository policy names the promotion target account (ADR 0012 L4).
 # shellcheck disable=SC2016  # HCL text
-good g7promo modules/m/ecr.tf 'locals {\n  p = {\n    Principal = { AWS = "arn:${local.partition}:iam::${var.promotion_target_account_id}:root" }\n  }\n}'
+good g7promo bootstrap/ecr.tf 'locals {\n  p = {\n    Principal = { AWS = "arn:${local.partition}:iam::${var.promotion_target_account_id}:root" }\n  }\n}'
 good gsrc modules/m/other.tf 'resource "x" "y" {\n  source = "anything"\n}'
 
 ok "all $n bad fixtures fail with their rule id"

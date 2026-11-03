@@ -202,16 +202,12 @@ guard_line="$(grep -n 'name: Check that the plan only deletes' "$destroy_wf" | c
 grep -qF 'APPLY_OUTCOME: ${{ steps.destroy.outcome }}' "$destroy_wf" || die "selftest: the destroy result summary must read the apply outcome"
 ok "terraform-destroy: dispatch only, credential-free confirm job, trusted file, shared concurrency group"
 
-# One source for the task caps: the iam_deploy.tf conditions equal lib.sh.
-tf_cap() { grep -A3 "variable = \"ecs:$1\"" "$ROOT/infra/terraform/bootstrap/iam_deploy.tf" | sed -n 's/.*values *= *\["\([0-9]*\)"\].*/\1/p'; }
-[ "$(tf_cap task-cpu)" = "$TASK_CPU_MAX" ] || die "selftest: TASK_CPU_MAX in lib.sh differs from iam_deploy.tf"
-[ "$(tf_cap task-memory)" = "$TASK_MEMORY_MAX" ] || die "selftest: TASK_MEMORY_MAX in lib.sh differs from iam_deploy.tf"
 # One account-ID check and one role-name helper in the summaries of the three pipelines (the OIDC smoke test checks the
 # exact ARN on purpose and is left out): no inline 12-digit pattern, no inline assumed-role ARN parse.
 summary_wfs=("$iac_wf" "$destroy_wf" "$deploy_wf" "$ROOT/.github/workflows/reusable-terraform-plan.yml")
 ! grep -En '\[0-9\]\{12\}' "${summary_wfs[@]}" || die "selftest: a workflow holds its own 12-digit pattern; use scripts/aws/assert-no-account-id.sh"
 ! grep -n 'assumed-role/' "${summary_wfs[@]}" || die "selftest: a workflow parses the assumed-role ARN; use scripts/names.sh role"
-ok "workflow path filters, build-scan isolation, cap parity and one account-ID check"
+ok "workflow path filters, build-scan isolation and one account-ID check"
 
 # The comment job holds the only write token, so its checkout must be the trusted base commit and never the PR head.
 # The job lives in the reusable plan workflow (ADR 0008, P6) and is read by its id from the parsed YAML.
@@ -254,45 +250,138 @@ for j in $plan_callers; do
 done
 ok "reusable plan: no environment on any job, explicit secrets in the caller"
 
-# Order inside the composite action: the role is assumed only after the environment root is selected and the CIDRs are
-# masked, so a bad environment or an empty required CIDR list is refused before any AWS call (ADR 0008 PR A, round 2).
+# Order inside the composite action: the role is assumed only after the environment root is selected and the
+# configuration is checked, so a bad environment is refused before any AWS call (ADR 0008 PR A, round 2).
 # The credentials step is found by its `uses:` (not its name), so renaming it cannot hide it.
-# step_order_ok <lines "name<TAB>uses">: exactly one credentials step, after the root selection and the CIDR mask.
+# step_order_ok <lines "name<TAB>uses">: exactly one credentials step, after the root selection and the config check.
 step_order_ok() {
   printf '%s\n' "$1" | awk -F'\t' '
     $2 ~ /^aws-actions\/configure-aws-credentials@/ { c++; cp = NR }
     $1 == "Select the environment root" { s++; sp = NR }
-    $1 == "Mask the ALB ingress CIDRs" { m++; mp = NR }
+    $1 == "Check configuration" { m++; mp = NR }
     END { exit !(c == 1 && s == 1 && m == 1 && sp < mp && cp > mp) }'
 }
 steps_now="$(facts composite-steps "$setup_action")"
-step_order_ok "$steps_now" || die "selftest: terraform-setup must select the root and mask the CIDRs before it assumes the role"
-# Mutations of the real step list: the credentials step first, before the mask, renamed and first, a second credentials
-# step before the selection, and a removed CIDR mask.
+step_order_ok "$steps_now" || die "selftest: terraform-setup must select the root and check the configuration before it assumes the role"
+# Mutations of the real step list: the credentials step first, before the check, renamed and first, a second
+# credentials step before the selection, and a removed config check.
 cred_line="$(awk -F'\t' '$2 ~ /^aws-actions\/configure-aws-credentials@/' <<<"$steps_now")"
 others="$(awk -F'\t' '$2 !~ /^aws-actions\/configure-aws-credentials@/' <<<"$steps_now")"
 renamed_line="$(printf 'Some other name\t%s' "${cred_line#*$'\t'}")"
 step_order_ok "$(printf '%s\n%s' "$cred_line" "$others")" && die "selftest: the order check missed the credentials step first"
 step_order_ok "$(printf '%s\n%s' "$renamed_line" "$others")" && die "selftest: the order check missed a renamed credentials step first"
 step_order_ok "$(printf '%s\n%s\n%s' "$(head -n1 <<<"$others")" "$cred_line" "$(tail -n +2 <<<"$others")")" \
-  && die "selftest: the order check missed the credentials step before the CIDR mask"
+  && die "selftest: the order check missed the credentials step before the config check"
 step_order_ok "$(printf '%s\n%s' "$cred_line" "$steps_now")" && die "selftest: the order check missed a second credentials step before the selection"
-step_order_ok "$(grep -v '^Mask the ALB' <<<"$steps_now")" && die "selftest: the order check missed a removed CIDR mask step"
-ok "terraform-setup action: the role is assumed after the root selection and the CIDR mask"
+step_order_ok "$(grep -v '^Check configuration' <<<"$steps_now")" && die "selftest: the order check missed a removed config check step"
+ok "terraform-setup action: the role is assumed after the root selection and the config check"
 
-# The promotion check (scripts/image/promote-resolve.sh) finds the dev deploy by the display name of the app-deploy job
-# `deploy`. Renaming either side alone would make every promotion fail (or, worse, match nothing), so the two must agree.
-# deploy_name_matches <workflow file>: the name of job `deploy` equals the deploy_job literal of the script.
-deploy_name_matches() {
+# The green check (scripts/image/promote-resolve.sh, run by app-promote and by an app-deploy rollback) finds the dev
+# release by the display names of the app-deploy jobs `deploy` and `verify` and of the deploy step that pushes. Renaming
+# either side alone would make every promotion fail (or, worse, match nothing), so the two must agree.
+# script_literal <name>: the value of <name>="..." in promote-resolve.sh.
+script_literal() { sed -nE "s/^$1=\"(.*)\"\$/\\1/p" "$ROOT/scripts/image/promote-resolve.sh"; }
+# job_name_matches <workflow file> <job id> <literal name>: the name of the job equals the literal of the script.
+job_name_matches() {
   local in_workflow in_script
-  in_workflow="$(facts names "$1" | awk -F'\t' '$1 == "deploy" { print $2 }')"
-  in_script="$(sed -nE 's/^deploy_job="(.*)"$/\1/p' "$ROOT/scripts/image/promote-resolve.sh")"
+  in_workflow="$(facts names "$1" | awk -F'\t' -v id="$2" '$1 == id { print $2 }')"
+  in_script="$(script_literal "$3")"
   [ -n "$in_workflow" ] && [ "$in_workflow" = "$in_script" ]
 }
-deploy_name_matches "$deploy_wf" || die "selftest: the name of the app-deploy job 'deploy' differs from deploy_job in scripts/image/promote-resolve.sh"
+job_name_matches "$deploy_wf" deploy deploy_job || die "selftest: the name of the app-deploy job 'deploy' differs from deploy_job in scripts/image/promote-resolve.sh"
+job_name_matches "$deploy_wf" verify verify_job || die "selftest: the name of the app-deploy job 'verify' differs from verify_job in scripts/image/promote-resolve.sh"
 sed 's/^    name: deploy (dev)$/    name: deploy (development)/' "$deploy_wf" >"$tmp/deploy-renamed.yml"
-deploy_name_matches "$tmp/deploy-renamed.yml" && die "selftest: the name check missed a renamed deploy job"
-ok "app-deploy: the deploy job name is the one promote-resolve.sh looks for"
+job_name_matches "$tmp/deploy-renamed.yml" deploy deploy_job && die "selftest: the name check missed a renamed deploy job"
+sed 's/^    name: verify (dev)$/    name: verify (development)/' "$deploy_wf" >"$tmp/verify-renamed.yml"
+! cmp -s "$deploy_wf" "$tmp/verify-renamed.yml" || die "selftest: could not rename the verify job"
+job_name_matches "$tmp/verify-renamed.yml" verify verify_job && die "selftest: the name check missed a renamed verify job"
+# The push step tells a deploy run from a rollback run: the deploy job has exactly one step of that name, and it runs
+# in mode deploy only.
+push_step_matches() {
+  local in_script
+  in_script="$(script_literal push_step)"
+  [ -n "$in_script" ] && facts job "$1" deploy | jq -e --arg s "$in_script" \
+    '[.steps[] | select(.name == $s)] | length == 1 and (.[0].if | test("RELEASE_MODE == .deploy."))' >/dev/null
+}
+push_step_matches "$deploy_wf" || die "selftest: app-deploy job 'deploy' has no step named like push_step in scripts/image/promote-resolve.sh, run in mode deploy only"
+sed 's/- name: Push the image to ECR$/- name: Push the image/' "$deploy_wf" >"$tmp/deploy-step-renamed.yml"
+! cmp -s "$deploy_wf" "$tmp/deploy-step-renamed.yml" || die "selftest: could not rename the push step"
+push_step_matches "$tmp/deploy-step-renamed.yml" && die "selftest: the push step check missed a renamed step"
+! grep -q '^release_step=' "$ROOT/scripts/image/promote-resolve.sh" || die "selftest: promote-resolve.sh still looks for a release step in the deploy job"
+ok "app-deploy: the deploy and verify jobs and the push step are the ones promote-resolve.sh looks for"
+
+# M1: the front-door check runs in its own job, after the release job, with no OIDC token, no environment and no
+# secret; the release job hands it the endpoint, the commit and the digest as job outputs. L5: an app-deploy rollback is
+# gated by the same credential-free resolve job as app-promote.
+promote_wf="$ROOT/.github/workflows/app-promote.yml"
+# verify_job_ok <release job id> <job json>: credential-free, needs the release job, runs only after a release, runs
+# verify-live.sh with the three outputs of the release job, and holds nothing but contents: read.
+verify_job_ok() {
+  credential_free "$2" 'aws-actions|AWS_ACCOUNT' \
+    && jq -e --arg rel "$1" '
+      (.needs == $rel or .needs == [$rel])
+      and (.if == "needs." + $rel + ".outputs.released == '"'true'"'")
+      and (.permissions == {"contents": "read"})
+      and ([.steps[] | select((.run // "") | test("scripts/lambda/verify-live.sh"))] | length == 1)
+      and ([.steps[] | .env // {} | to_entries[] | .value] | sort
+        == (["api-endpoint", "sha", "digest"] | map("${{ needs." + $rel + ".outputs." + . + " }}") | sort))' <<<"$2" >/dev/null
+}
+verify_deploy_ok() { verify_job_ok deploy "$1"; }
+verify_promote_ok() { verify_job_ok promote "$1"; }
+# shellcheck disable=SC2016  # the mutations are workflow text, not shell
+mutation_cases verify_deploy_ok "$deploy_wf" verify "credential-free, after the deploy job, reading its outputs" \
+  '{"permissions":{"id-token":"write"}}' '{"environment":"dev"}' '{"env":{"X":"${{ secrets.X }}"}}' \
+  '{"permissions":{"actions":"read"}}' '{"needs":"build-scan"}' '{"if":"always()"}' \
+  '{"steps":[{"uses":"aws-actions/configure-aws-credentials@v1"}]}' '{"steps":[{"run":"scripts/lambda/verify-live.sh x y z"}]}'
+# shellcheck disable=SC2016  # the mutations are workflow text, not shell
+mutation_cases verify_promote_ok "$promote_wf" verify "credential-free, after the promote job, reading its outputs" \
+  '{"permissions":{"id-token":"write"}}' '{"environment":"prod"}' '{"env":{"X":"${{ secrets.X }}"}}' '{"needs":"resolve"}'
+# release_outputs_ok <job json>: the release job hands exactly these outputs over, from the step that runs after the
+# alias moved, and that step writes them only after a release.
+release_outputs_ok() {
+  jq -e '
+    (.outputs | keys | sort) == (["api-endpoint", "digest", "released", "sha"])
+    and all(.outputs[]; test("^\\$\\{\\{ steps\\.release\\.outputs\\.[a-z-]+ \\}\\}$"))
+    and ([.steps[] | select(.id == "release")] | length == 1)
+    and ([.steps[] | .id // ""] | index("release") > index("canary"))' <<<"$1" >/dev/null
+}
+# shellcheck disable=SC2016  # the mutations are workflow text, not shell
+mutation_cases release_outputs_ok "$deploy_wf" deploy "the source of the verify job outputs" '{"outputs":{"x":"${{ secrets.X }}"}}'
+release_outputs_ok "$(job_json "$promote_wf" promote)" || die "selftest: app-promote job 'promote' must hand its release to verify"
+# resolve_job_ok <job json>: credential-free, rollback only, actions: read, runs promote-resolve.sh with the sha input.
+resolve_job_ok() {
+  credential_free "$1" 'aws-actions' \
+    && jq -e '(.if | test("inputs.mode == .rollback.")) and .permissions == {"contents": "read", "actions": "read"}
+      and ([.steps[] | select((.run // "") == "scripts/image/promote-resolve.sh \"$SHA\"")] | length == 1)' <<<"$1" >/dev/null
+}
+# shellcheck disable=SC2016  # the mutations are workflow text, not shell
+mutation_cases resolve_job_ok "$deploy_wf" resolve "the credential-free green check of a rollback" \
+  '{"permissions":{"id-token":"write"}}' '{"environment":"dev"}' '{"if":"github.ref == '"'refs/heads/main'"'"}'
+# The deploy job waits for the gate: a rollback runs only after a green resolve, a deploy only after a green build.
+deploy_gate_ok() {
+  jq -e '([.needs] | flatten | sort) == ["build-scan", "resolve"]
+    and (.if | test("inputs.mode == .rollback. && needs.build-scan.result == .skipped. && needs.resolve.result == .success."))' <<<"$1" >/dev/null
+}
+mutation_cases deploy_gate_ok "$deploy_wf" deploy "gated by resolve in mode rollback" '{"needs":"build-scan"}' \
+  '{"if":"github.ref == '"'refs/heads/main'"' && (needs.build-scan.result == '"'success'"' || inputs.mode == '"'rollback'"')"}'
+# L6 and M1 in the credentialed jobs: no Docker (sudo and containers off), no execute-api host anywhere in the file.
+for wf in "$deploy_wf" "$promote_wf"; do
+  ! grep -n 'execute-api' "$wf" | grep -v '^[0-9]*: *#' || die "selftest: ${wf##*/} names an execute-api host outside a comment"
+  ! grep -nE '(^|[^a-z])docker (load|push|login|tag)' "$wf" || die "selftest: ${wf##*/} runs docker in a release job"
+done
+# shellcheck disable=SC2016  # workflow text, not shell
+grep -q 'scripts/ci/install-tools.sh "$RUNNER_TEMP/tools" crane' "$deploy_wf" || die "selftest: the deploy job must install crane with the checksum-verified installer"
+! grep -q 'scripts/image/import.sh' "$deploy_wf" || die "selftest: the deploy job must not load the image into Docker"
+# C4: the environment variables reach the release inputs through env only, never through run text.
+# shellcheck disable=SC2016  # workflow expressions, not shell
+for wf in "$deploy_wf" "$promote_wf"; do
+  for v in RELEASE_STRATEGY CANARY_PERCENT BAKE_MINUTES; do
+    grep -qE "^ +[A-Z_]+: \\\$\{\{ vars\.${v} \}\}$" "$wf" || die "selftest: ${wf##*/} must pass vars.${v} through env"
+  done
+  ! facts jobs "$wf" | while read -r j; do facts job "$wf" "$j"; done | jq -e 'select(any(.steps[]?; (.run // "") | test("vars\\.")))' >/dev/null \
+    || die "selftest: ${wf##*/} reads vars in run text"
+done
+ok "verify jobs without credentials, the rollback gate, no Docker and no execute-api host in the release jobs"
 
 # The shared Terraform job start lives in one local action (ADR 0008, P6). Its "Select the environment root" step must fail
 # for a bad environment and leave GITHUB_ENV empty: the step text is run with the same shell flags the runner uses.
@@ -317,23 +406,20 @@ printf '      run: echo "TF_DIR=$(scripts/names.sh env-root)" >> "$GITHUB_ENV"\n
 env_file_inline_substitution "$tmp/wf-inline-env.yml" >/dev/null || die "selftest: the GITHUB_ENV pattern missed an inline command substitution"
 ! env_file_inline_substitution "$ROOT"/.github/workflows/*.yml "$ROOT"/.github/actions/*/action.yml \
   || die "selftest: a workflow builds a GITHUB_ENV line from an inline command substitution (assign it first)"
-# Every credentialed Terraform job starts from the action. Only the apply requires the ALB CIDRs (fail closed).
-# setup_job_ok <workflow> <job id> <true|false>: the job starts from the action; require-alb-ingress-cidrs is set to "true" only
-# for the apply.
+# Every credentialed Terraform job starts from the action, and no ALB or promotion-target wiring is left (ADR 0012 L4,
+# L11: no ALB, and the promotion target is in the admin-applied bootstrap).
+# setup_job_ok <workflow> <job id>: the job starts from the action and maps no removed secret.
 setup_job_ok() {
   local job
   job="$(job_json "$1" "$2")"
   grep -qF '"uses": "./.github/actions/terraform-setup"' <<<"$job" || die "selftest: ${1##*/} job '$2' must start from ./.github/actions/terraform-setup"
-  if [ "$3" = true ]; then
-    grep -qF '"require-alb-ingress-cidrs": "true"' <<<"$job" || die "selftest: the ${2} job must set require-alb-ingress-cidrs: true"
-  else
-    ! grep -qF 'require-alb-ingress-cidrs' <<<"$job" || die "selftest: the ${2} job must not require the ALB CIDRs (only the apply fails closed)"
-  fi
 }
-setup_job_ok "$iac_wf" apply true
-setup_job_ok "$destroy_wf" destroy false
-setup_job_ok "$plan_wf" plan false
-ok "terraform-setup action: bad environments fail the select step, no inline GITHUB_ENV substitution, apply fails closed"
+setup_job_ok "$iac_wf" apply
+setup_job_ok "$destroy_wf" destroy
+setup_job_ok "$plan_wf" plan
+! grep -nE 'ALB_INGRESS|alb-ingress|alb_ingress|PROMOTION_TARGET|promotion_target|mask-cidrs' "$iac_wf" "$destroy_wf" "$plan_wf" "$setup_action" \
+  || die "selftest: a Terraform workflow still wires the ALB CIDRs or the promotion target"
+ok "terraform-setup action: bad environments fail the select step, no inline GITHUB_ENV substitution, no ALB wiring"
 
 # Action pins (NFR-3, ADR 0007 S1): every `uses:` is a full commit SHA with its version in a comment, and one action
 # has one SHA across all workflows, so a half-finished bump (or a tag-only pin) fails here and not only in zizmor.
@@ -490,14 +576,16 @@ case_hardening "harden-runner with continue-on-error" "must not set \`continue-o
 case_hardening "credentialed job with container" "\`container:\` is not allowed" "$cred" "$block_with" '    container: alpine\n'
 case_hardening "credentialed job with services" "\`services:\` is not allowed" "$cred" "$block_with" '    services:\n      db:\n        image: postgres\n'
 case_hardening "credential-free job with container" ok "contents: read" "$audit_with" '    container: alpine\n'
-# The one named exception: app-deploy.yml deploy needs docker, so it may leave containers on; any other job may not.
+# No container exception any more (review L6): app-deploy.yml deploy pushes with crane, so it needs
+# disable-sudo-and-containers like every credentialed job.
 mkdir -p "$tmp/exc"
 write_hardening "$tmp/exc/app-deploy.yml" deploy "$cred" '          egress-policy: block\n          disable-telemetry: true\n'
-case_check guard/harden-runner.sh "app-deploy deploy without disable-sudo-and-containers" ok "$tmp/exc/app-deploy.yml"
+case_check guard/harden-runner.sh "app-deploy deploy without disable-sudo-and-containers" "disable-sudo-and-containers must be true" "$tmp/exc/app-deploy.yml"
+write_hardening "$tmp/exc/app-deploy.yml" deploy "$cred" '          egress-policy: block\n          disable-telemetry: true\n          disable-sudo-and-containers: false\n'
+case_check guard/harden-runner.sh "app-deploy deploy with disable-sudo-and-containers false" "disable-sudo-and-containers must be true" "$tmp/exc/app-deploy.yml"
 write_hardening "$tmp/exc/app-deploy.yml" other "$cred" '          egress-policy: block\n          disable-telemetry: true\n'
 case_check guard/harden-runner.sh "another app-deploy job without it" "disable-sudo-and-containers must be true" "$tmp/exc/app-deploy.yml"
-write_hardening "$tmp/exc/other.yml" deploy "$cred" '          egress-policy: block\n          disable-telemetry: true\n'
-case_check guard/harden-runner.sh "deploy in another file without it" "disable-sudo-and-containers must be true" "$tmp/exc/other.yml"
+! grep -q 'NEEDS_CONTAINERS' "$ROOT/scripts/guard/harden_runner_policy.py" || die "selftest: the policy still has a container exception"
 # The one source registry exception (ADR 0008 P8): only app-promote.yml promote may name the dev account in a host.
 # shellcheck disable=SC2016  # workflow expressions, not shell
 src_host='            ${{ secrets.AWS_ACCOUNT_ID_DEV }}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com:443\n'
@@ -510,6 +598,24 @@ case_check guard/harden-runner.sh "promote in another file with the dev registry
 # shellcheck disable=SC2016  # workflow expressions, not shell
 write_hardening "$tmp/exc/app-promote.yml" promote "$cred" "${block_with}${hosts_head}"'            ${{ secrets.AWS_ACCOUNT_ID_QA }}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com:443\n'
 case_check guard/harden-runner.sh "app-promote promote with another account secret" "uses the expression 'secrets.AWS_ACCOUNT_ID_QA'" "$tmp/exc/app-promote.yml"
+# No wildcard family any more (review M1): an `*.execute-api` host is refused in every credentialed job, including
+# app-deploy deploy and app-promote promote, and in a job of any other name. A job without credentials (verify) may
+# still list it, in audit.
+# shellcheck disable=SC2016  # workflow expressions, not shell
+api_host='            *.execute-api.${{ vars.AWS_REGION }}.amazonaws.com:443\n'
+for target in "app-deploy.yml deploy" "app-promote.yml promote" "app-deploy.yml verify" "app-promote.yml verify" "other.yml deploy"; do
+  write_hardening "$tmp/exc/${target% *}" "${target#* }" "$cred" "${block_with}${hosts_head}${api_host}"
+  case_check guard/harden-runner.sh "${target% *} ${target#* } (credentialed) with the execute-api wildcard" "holds a wildcard" "$tmp/exc/${target% *}"
+done
+# shellcheck disable=SC2016  # workflow expressions, not shell
+for wild in '*.execute-api.ap-southeast-1.amazonaws.com:443' '*.amazonaws.com:443' '*.execute-api.*.amazonaws.com:443' \
+  '*.${{ vars.AWS_REGION }}.amazonaws.com:443' '*.execute-api.${{ vars.AWS_REGION }}.amazonaws.com:8443' 'x*.execute-api.${{ vars.AWS_REGION }}.amazonaws.com:443'; do
+  write_hardening "$tmp/exc/app-deploy.yml" deploy "$cred" "${block_with}${hosts_head}            ${wild}\n"
+  case_check guard/harden-runner.sh "app-deploy deploy with the wildcard ${wild}" "holds a wildcard" "$tmp/exc/app-deploy.yml"
+done
+write_hardening "$tmp/exc/app-deploy.yml" verify "contents: read" "${audit_with}${hosts_head}${api_host}"
+case_check guard/harden-runner.sh "app-deploy verify (no credentials, audit) with the execute-api host" ok "$tmp/exc/app-deploy.yml"
+! grep -q 'EXECUTE_API' "$ROOT/scripts/guard/harden_runner_policy.py" || die "selftest: the policy still has an execute-api exception"
 # A job without credentials in audit may list nothing; a missing harden-runner first step fails.
 printf 'name: x\non: push\njobs:\n  j:\n    runs-on: ubuntu-24.04\n    permissions:\n      contents: read\n    steps:\n      - run: echo hi\n' >"$tmp/h.yml"
 expect_fail "job with no harden-runner first step" "first step is not step-security/harden-runner" "$ROOT/scripts/guard/harden-runner.sh" "$tmp/h.yml"

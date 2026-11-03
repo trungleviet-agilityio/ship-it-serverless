@@ -1,5 +1,5 @@
 # The shared start of every Terraform job that holds AWS credentials (ADR 0008, P6): select the environment root,
-# install the checksum-verified tools, check the configuration, assume the role, init, and mask the ALB CIDRs.
+# install the checksum-verified tools, check the configuration, assume the role and init.
 # Used by the reusable plan, the terraform-iac apply and the terraform-destroy jobs.
 #
 # The caller job keeps harden-runner as step 1 (with its own exact allowlist) and checks the repository out first: this
@@ -11,7 +11,7 @@
 # The OIDC token claims (sub, job_workflow_ref) do not change inside a local action, so the role trust is unaffected.
 # `TF_DIR` goes to GITHUB_ENV and stays visible to the later steps of the calling job.
 name: terraform-setup
-description: Select the environment root, install tools, check the configuration, assume the role, init and mask the ALB CIDRs
+description: Select the environment root, install tools, check the configuration, assume the role and init
 
 inputs:
   env:
@@ -32,14 +32,6 @@ inputs:
   session-prefix:
     description: Role session name prefix (plan, apply or destroy); the run ID and attempt are appended
     required: true
-  alb-ingress-cidrs:
-    description: Optional JSON list of CIDRs allowed to reach the ALB (masked element by element)
-    required: false
-    default: ""
-  require-alb-ingress-cidrs:
-    description: "true makes an empty alb-ingress-cidrs fail (the apply fails closed); anything else leaves it optional"
-    required: false
-    default: "false"
 
 runs:
   using: composite
@@ -72,22 +64,6 @@ runs:
       run: |
         case "$ROLE_KIND" in plan | apply) ;; *) echo "::error::role-kind must be plan or apply"; exit 1 ;; esac
         scripts/aws/check-config.sh "$ROLE_KIND"
-
-    # Optional secret: a JSON list of CIDRs allowed to reach the ALB. Each element is masked before Terraform can print
-    # it. The apply requires it (set it to ["0.0.0.0/0"] to open the ALB on purpose); this runs before the role is
-    # assumed, so a refusal costs no AWS call. The plan and the destroy leave it optional.
-    - name: Mask the ALB ingress CIDRs
-      shell: bash
-      env:
-        ENV: ${{ inputs.env }}
-        CIDRS: ${{ inputs.alb-ingress-cidrs }}
-        REQUIRE: ${{ inputs.require-alb-ingress-cidrs }}
-      run: |
-        if [[ "$REQUIRE" == "true" ]]; then
-          scripts/tf/mask-cidrs.sh --require
-        else
-          scripts/tf/mask-cidrs.sh
-        fi
 
     - name: Assume the ${{ inputs.role-kind }} role
       uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0

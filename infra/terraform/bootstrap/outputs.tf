@@ -24,9 +24,19 @@ output "oidc_provider_arn" {
   value       = aws_iam_openid_connect_provider.github.arn
 }
 
-output "ecs_permissions_boundary_arn" {
-  description = "Boundary that every ECS task and execution role must carry."
-  value       = aws_iam_policy.ecs_boundary.arn
+output "app_permissions_boundary_arn" {
+  description = "Boundary that the function execution role must carry (ADR 0012 L9)."
+  value       = aws_iam_policy.app_boundary.arn
+}
+
+output "ecr_repository_name" {
+  description = "ECR repository of this environment's app image (ADR 0012 L4)."
+  value       = aws_ecr_repository.app.name
+}
+
+output "ecr_repository_url" {
+  description = "ECR repository URL that App Deploy pushes to. Holds the account ID: copy it into a GitHub secret, not a variable."
+  value       = aws_ecr_repository.app.repository_url
 }
 
 output "oidc_sub_prefix" {
@@ -40,7 +50,7 @@ output "aws_region" {
 }
 
 output "resource_names" {
-  description = "Name contract that envs/dev must follow (ADR 0002)."
+  description = "Name contract that envs/<env> and modules/app-lambda must follow (ADR 0002, ADR 0012)."
   value       = local.resource_names
 }
 

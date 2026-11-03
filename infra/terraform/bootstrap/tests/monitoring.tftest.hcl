@@ -165,8 +165,8 @@ run "alert_rule_pattern" {
   assert {
     condition = (
       toset(jsondecode(aws_cloudwatch_event_rule.oidc_unexpected.event_pattern).detail["$or"][1].userIdentity.userName[0]["anything-but"]) == toset([
-        "repo:trungleviet-agilityio@111/ship-it-safely@222:pull_request",
-        "repo:trungleviet-agilityio@111/ship-it-safely@222:environment:dev",
+        "repo:trungleviet-agilityio@111/ship-it-serverless@222:pull_request",
+        "repo:trungleviet-agilityio@111/ship-it-serverless@222:environment:dev",
       ])
       && length(jsondecode(aws_cloudwatch_event_rule.oidc_unexpected.event_pattern).detail["$or"][1].userIdentity.userName[0]["anything-but"]) == 2
     )
@@ -221,19 +221,44 @@ run "topic_policy_and_subscription" {
 
   assert {
     condition = (
-      length(data.aws_iam_policy_document.security_alerts.statement) == 1
+      toset([for s in data.aws_iam_policy_document.security_alerts.statement : s.sid]) == toset(["EventBridgePublish", "CloudWatchAlarmPublish"])
       && alltrue([
         for s in data.aws_iam_policy_document.security_alerts.statement : (
           s.effect == "Allow"
           && toset(s.actions) == toset(["sns:Publish"])
-          && toset(flatten([for p in s.principals : p.identifiers])) == toset(["events.amazonaws.com"])
-          && anytrue([
-            for c in s.condition : c.variable == "aws:SourceArn" && toset(c.values) == toset([aws_cloudwatch_event_rule.oidc_unexpected.arn])
-          ])
+          && toset(s.resources) == toset([aws_sns_topic.security_alerts.arn])
         )
       ])
     )
-    error_message = "only events.amazonaws.com may publish, and only for the rule ARN"
+    error_message = "the topic policy has exactly two Allow statements, both sns:Publish on the topic only"
+  }
+
+  assert {
+    condition = alltrue([
+      for s in data.aws_iam_policy_document.security_alerts.statement : (
+        toset(flatten([for p in s.principals : p.identifiers])) == toset(["events.amazonaws.com"])
+        && anytrue([
+          for c in s.condition : c.variable == "aws:SourceArn" && toset(c.values) == toset([aws_cloudwatch_event_rule.oidc_unexpected.arn])
+        ])
+      ) if s.sid == "EventBridgePublish"
+    ])
+    error_message = "only events.amazonaws.com may publish for the rule ARN"
+  }
+
+  # ADR 0012 L10: the app alarms of this env only, in this account.
+  assert {
+    condition = alltrue([
+      for s in data.aws_iam_policy_document.security_alerts.statement : (
+        toset(flatten([for p in s.principals : p.identifiers])) == toset(["cloudwatch.amazonaws.com"])
+        && anytrue([
+          for c in s.condition : c.test == "ArnLike" && c.variable == "aws:SourceArn" && toset(c.values) == toset(["arn:aws:cloudwatch:ap-southeast-1:123456789012:alarm:sis-dev-*"])
+        ])
+        && anytrue([
+          for c in s.condition : c.test == "StringEquals" && c.variable == "aws:SourceAccount" && toset(c.values) == toset(["123456789012"])
+        ])
+      ) if s.sid == "CloudWatchAlarmPublish"
+    ])
+    error_message = "cloudwatch.amazonaws.com may publish only for this env's alarms in this account"
   }
 
   assert {

@@ -27,7 +27,7 @@ run "subjects_use_immutable_ids" {
   command = plan
 
   assert {
-    condition     = local.gh_sub_prefix == "repo:trungleviet-agilityio@111/ship-it-safely@222"
+    condition     = local.gh_sub_prefix == "repo:trungleviet-agilityio@111/ship-it-serverless@222"
     error_message = "gh_sub_prefix must carry the owner and repo IDs"
   }
 
@@ -35,7 +35,7 @@ run "subjects_use_immutable_ids" {
     condition = flatten([
       for c in data.aws_iam_policy_document.trust["plan"].statement[0].condition : c.values
       if c.variable == "token.actions.githubusercontent.com:sub"
-    ]) == ["repo:trungleviet-agilityio@111/ship-it-safely@222:pull_request"]
+    ]) == ["repo:trungleviet-agilityio@111/ship-it-serverless@222:pull_request"]
     error_message = "plan role sub must be the pull_request subject"
   }
 
@@ -44,7 +44,7 @@ run "subjects_use_immutable_ids" {
       for k in ["apply", "deploy"] : flatten([
         for c in data.aws_iam_policy_document.trust[k].statement[0].condition : c.values
         if c.variable == "token.actions.githubusercontent.com:sub"
-      ]) == ["repo:trungleviet-agilityio@111/ship-it-safely@222:environment:dev"]
+      ]) == ["repo:trungleviet-agilityio@111/ship-it-serverless@222:environment:dev"]
     ])
     error_message = "apply and deploy subs must end with :environment:dev"
   }
@@ -179,7 +179,7 @@ run "name_based_subject_fallback" {
   }
 
   assert {
-    condition     = local.gh_sub_prefix == "repo:trungleviet-agilityio/ship-it-safely"
+    condition     = local.gh_sub_prefix == "repo:trungleviet-agilityio/ship-it-serverless"
     error_message = "fallback prefix must use names"
   }
 }
@@ -192,8 +192,8 @@ run "job_workflow_ref_pinned" {
       for c in data.aws_iam_policy_document.trust["apply"].statement[0].condition : c.values
       if c.variable == "token.actions.githubusercontent.com:job_workflow_ref" && c.test == "StringEquals"
       ])) == toset([
-      "trungleviet-agilityio/ship-it-safely/.github/workflows/terraform-iac.yml@refs/heads/main",
-      "trungleviet-agilityio/ship-it-safely/.github/workflows/terraform-destroy.yml@refs/heads/main",
+      "trungleviet-agilityio/ship-it-serverless/.github/workflows/terraform-iac.yml@refs/heads/main",
+      "trungleviet-agilityio/ship-it-serverless/.github/workflows/terraform-destroy.yml@refs/heads/main",
     ])
     error_message = "apply job_workflow_ref must be exactly the terraform-iac and terraform-destroy files at main"
   }
@@ -202,7 +202,7 @@ run "job_workflow_ref_pinned" {
     condition = toset(flatten([
       for c in data.aws_iam_policy_document.trust["deploy"].statement[0].condition : c.values
       if c.variable == "token.actions.githubusercontent.com:job_workflow_ref" && c.test == "StringEquals"
-    ])) == toset(["trungleviet-agilityio/ship-it-safely/.github/workflows/app-deploy.yml@refs/heads/main"])
+    ])) == toset(["trungleviet-agilityio/ship-it-serverless/.github/workflows/app-deploy.yml@refs/heads/main"])
     error_message = "deploy job_workflow_ref must be exactly the app-deploy file at main"
   }
 
@@ -289,7 +289,7 @@ run "promoted_env_trusts_app_promote" {
     condition = toset(flatten([
       for c in data.aws_iam_policy_document.trust["deploy"].statement[0].condition : c.values
       if c.variable == "token.actions.githubusercontent.com:job_workflow_ref" && c.test == "StringEquals"
-    ])) == toset(["trungleviet-agilityio/ship-it-safely/.github/workflows/app-promote.yml@refs/heads/main"])
+    ])) == toset(["trungleviet-agilityio/ship-it-serverless/.github/workflows/app-promote.yml@refs/heads/main"])
     error_message = "a promoted env's deploy job_workflow_ref must be exactly the app-promote file at main"
   }
 
@@ -297,7 +297,7 @@ run "promoted_env_trusts_app_promote" {
     condition = flatten([
       for c in data.aws_iam_policy_document.trust["deploy"].statement[0].condition : c.values
       if c.variable == "token.actions.githubusercontent.com:sub"
-    ]) == ["repo:trungleviet-agilityio@111/ship-it-safely@222:environment:prod"]
+    ]) == ["repo:trungleviet-agilityio@111/ship-it-serverless@222:environment:prod"]
     error_message = "a promoted env's deploy sub must end with :environment:prod"
   }
 

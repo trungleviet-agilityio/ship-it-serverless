@@ -3,3 +3,8 @@ aws_account_id  = "<DEV_ACCOUNT_ID>"
 budget_email    = "<BUDGET_EMAIL>"
 github_owner_id = "<OWNER_ID>" # gh api repos/OWNER/REPO --jq .owner.id
 github_repo_id  = "<REPO_ID>"  # gh api repos/OWNER/REPO --jq .id
+
+# Promotion target (ADR 0008 P9, ADR 0012 L4): uncomment once the prod account exists. It adds PromotionPull to the
+# ECR repository policy, so the prod deploy role (<prefix>-prod-gha-deploy) may pull from this repository, pull
+# actions only. promotion_target_env defaults to "prod". Left commented so make new-env does not copy it.
+# promotion_target_account_id = "<PROD_ACCOUNT_ID>"

@@ -1,35 +1,14 @@
 resource "aws_iam_role" "apply" {
   name                 = local.role_names.apply
-  description          = "GitHub Actions apply for envs/dev, scoped to the services of modules/app-ecs"
+  description          = "GitHub Actions apply for envs/<env>, scoped to the services of modules/app-lambda"
   path                 = "/"
   max_session_duration = 3600
   assume_role_policy   = data.aws_iam_policy_document.trust["apply"].json
 }
 
-locals {
-  ec2_arn = "${local.svc_arn["ec2"]}:*"
-
-  # Resource-type ARNs, so no statement guarded by RequestTag spans the whole region.
-  ec2_type_arn = { for t in ["vpc", "subnet", "internet-gateway", "route-table", "security-group", "security-group-rule"] : t => "${local.svc_arn["ec2"]}:${t}/*" }
-
-  ec2_create_actions = [
-    "CreateVpc",
-    "CreateSubnet",
-    "CreateInternetGateway",
-    "CreateRouteTable",
-    "CreateSecurityGroup",
-    "AuthorizeSecurityGroupIngress",
-    "AuthorizeSecurityGroupEgress",
-  ]
-
-  elb_arns = [
-    "${local.svc_arn["elasticloadbalancing"]}:loadbalancer/app/${local.name}-*/*",
-    "${local.svc_arn["elasticloadbalancing"]}:targetgroup/${local.name}-*/*",
-    "${local.svc_arn["elasticloadbalancing"]}:listener/app/${local.name}-*/*/*",
-    "${local.svc_arn["elasticloadbalancing"]}:listener-rule/app/${local.name}-*/*/*/*",
-  ]
-}
-
+# ADR 0012 L9 (FR-4 rewritten): state as before, then exactly what modules/app-lambda creates. The ECR repository
+# lives in bootstrap (L4), so the apply role only reads it. EC2, ELB, ECS and ECR-write statements are gone with ECS
+# (L11).
 data "aws_iam_policy_document" "apply" {
   # State access (B18).
   statement {
@@ -59,325 +38,99 @@ data "aws_iam_policy_document" "apply" {
     resources = [local.lock_arn]
   }
 
-  # EC2 has random IDs, so scope by tag (B14).
+  # Function, alias, permission, concurrency and tags (L3), as the aws provider calls them for aws_lambda_function,
+  # aws_lambda_alias and aws_lambda_permission. Scoped to this env's functions and their qualified ARNs.
+  # UpdateFunctionCode stays: architectures is set through it, even though Terraform ignores image_uri.
+  # GetFunctionRecursionConfig is defensive: the provider may read it on refresh; read only, same scope.
+  # RemovePermission stays here without the lambda:Principal condition of LambdaAddPermissionApiGateway: removing
+  # a permission can only narrow who may invoke, and a condition key the request lacked would block a destroy.
   statement {
-    sid       = "Ec2Read"
-    effect    = "Allow"
-    actions   = ["ec2:Describe*"]
-    resources = ["*"] # No resource-level support for Describe
-  }
-
-  # Creates carry the tags on the new resource (RequestTag). A parent that already exists must carry them too
-  # (ResourceTag), so a child cannot be attached to a VPC that this lab does not own.
-  statement {
-    sid     = "Ec2CreateTopLevelTagged"
-    effect  = "Allow"
-    actions = ["ec2:CreateVpc", "ec2:CreateInternetGateway"]
-    resources = [
-      local.ec2_type_arn["vpc"],
-      local.ec2_type_arn["internet-gateway"],
-    ]
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:RequestTag/Project"
-      values   = [local.tag_project]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:RequestTag/Env"
-      values   = [var.env]
-    }
-  }
-
-  statement {
-    sid     = "Ec2CreateChildTagged"
-    effect  = "Allow"
-    actions = ["ec2:CreateSubnet", "ec2:CreateRouteTable", "ec2:CreateSecurityGroup"]
-    resources = [
-      local.ec2_type_arn["subnet"],
-      local.ec2_type_arn["route-table"],
-      local.ec2_type_arn["security-group"],
-    ]
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:RequestTag/Project"
-      values   = [local.tag_project]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:RequestTag/Env"
-      values   = [var.env]
-    }
-  }
-
-  statement {
-    sid       = "Ec2CreateChildInTaggedVpc"
-    effect    = "Allow"
-    actions   = ["ec2:CreateSubnet", "ec2:CreateRouteTable", "ec2:CreateSecurityGroup"]
-    resources = [local.ec2_type_arn["vpc"]]
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:ResourceTag/Project"
-      values   = [local.tag_project]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:ResourceTag/Env"
-      values   = [var.env]
-    }
-  }
-
-  # Authorize* touches the security group (tags exist) and the new rule (no tags yet, only RequestTag is
-  # available there). The rule statement carries no condition: it is useless without the gated group statement.
-  statement {
-    sid       = "Ec2AuthorizeRulesOnTaggedGroup"
-    effect    = "Allow"
-    actions   = ["ec2:AuthorizeSecurityGroupIngress", "ec2:AuthorizeSecurityGroupEgress"]
-    resources = [local.ec2_type_arn["security-group"]]
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:ResourceTag/Project"
-      values   = [local.tag_project]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:ResourceTag/Env"
-      values   = [var.env]
-    }
-  }
-
-  statement {
-    sid       = "Ec2AuthorizeRuleResource"
-    effect    = "Allow"
-    actions   = ["ec2:AuthorizeSecurityGroupIngress", "ec2:AuthorizeSecurityGroupEgress"]
-    resources = [local.ec2_type_arn["security-group-rule"]]
-  }
-
-  statement {
-    sid     = "Ec2TagOnCreate"
-    effect  = "Allow"
-    actions = ["ec2:CreateTags"]
-    resources = [for t in ["vpc", "subnet", "internet-gateway", "route-table", "security-group", "security-group-rule"] :
-    local.ec2_type_arn[t]]
-
-    condition {
-      test     = "StringEquals"
-      variable = "ec2:CreateAction"
-      values   = local.ec2_create_actions
-    }
-  }
-
-  statement {
-    sid    = "Ec2ManageTagged"
+    sid    = "LambdaFunction"
     effect = "Allow"
     actions = [
-      "ec2:DeleteVpc",
-      "ec2:ModifyVpcAttribute",
-      "ec2:DeleteSubnet",
-      "ec2:ModifySubnetAttribute",
-      "ec2:AttachInternetGateway",
-      "ec2:DetachInternetGateway",
-      "ec2:DeleteInternetGateway",
-      "ec2:DeleteRouteTable",
-      "ec2:CreateRoute",
-      "ec2:ReplaceRoute",
-      "ec2:DeleteRoute",
-      "ec2:AssociateRouteTable",
-      "ec2:DisassociateRouteTable",
-      "ec2:DeleteSecurityGroup",
-      "ec2:RevokeSecurityGroupIngress",
-      "ec2:RevokeSecurityGroupEgress",
-      "ec2:ModifySecurityGroupRules",
-      "ec2:UpdateSecurityGroupRuleDescriptionsIngress",
-      "ec2:UpdateSecurityGroupRuleDescriptionsEgress",
-      "ec2:CreateTags",
-      "ec2:DeleteTags",
+      "lambda:CreateFunction",
+      "lambda:DeleteFunction",
+      "lambda:GetFunction",
+      "lambda:GetFunctionConfiguration",
+      "lambda:GetFunctionCodeSigningConfig",
+      "lambda:GetFunctionRecursionConfig",
+      "lambda:GetRuntimeManagementConfig",
+      "lambda:UpdateFunctionCode",
+      "lambda:UpdateFunctionConfiguration",
+      "lambda:PublishVersion",
+      "lambda:ListVersionsByFunction",
+      "lambda:CreateAlias",
+      "lambda:DeleteAlias",
+      "lambda:GetAlias",
+      "lambda:UpdateAlias",
+      "lambda:RemovePermission",
+      "lambda:GetPolicy",
+      "lambda:PutFunctionConcurrency",
+      "lambda:DeleteFunctionConcurrency",
+      "lambda:GetFunctionConcurrency",
+      "lambda:TagResource",
+      "lambda:UntagResource",
+      "lambda:ListTags",
     ]
-    resources = [local.ec2_arn]
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:ResourceTag/Project"
-      values   = [local.tag_project]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:ResourceTag/Env"
-      values   = [var.env]
-    }
+    resources = local.function_arns_env
   }
 
-  # The provider calls this when it creates an ALB with security groups. Tag-scoped, no wildcard action.
+  # The only resource-based permission the module adds is the HTTP API's (aws_lambda_permission.api). AddPermission
+  # supports the lambda:Principal condition key (Service Authorization Reference, AWS Lambda), so the apply role can
+  # never grant invoke to another account or service, or create a public Function URL permission.
   statement {
-    sid       = "Ec2ValidateSgQuotasOnTaggedGroup"
+    sid       = "LambdaAddPermissionApiGateway"
     effect    = "Allow"
-    actions   = ["ec2:ValidateSecurityGroupQuotasForInterface"]
-    resources = ["${local.svc_arn["ec2"]}:security-group/*"]
+    actions   = ["lambda:AddPermission"]
+    resources = local.function_arns_env
 
     condition {
       test     = "StringEquals"
-      variable = "aws:ResourceTag/Project"
-      values   = [local.tag_project]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:ResourceTag/Env"
-      values   = [var.env]
+      variable = "lambda:Principal"
+      values   = ["apigateway.amazonaws.com"]
     }
   }
 
-  # ELB calls this with the caller's identity when it creates a load balancer. Its only resource type is vpc.
+  # The one repository, read only; the repository and its policy belong to bootstrap (L4).
+  # - DescribeImages, DescribeRepositories: data "aws_ecr_image" (most_recent) finds the newest image (L3).
+  # - BatchGetImage, GetDownloadUrlForLayer, GetRepositoryPolicy: CreateFunction and UpdateFunctionCode with an
+  #   image need them on the caller (Lambda Developer Guide, "Create a function using a container image").
+  # The same page lists ecr:SetRepositoryPolicy, which exists so Lambda can add its own pull statement to the
+  # repository policy. It is not granted: bootstrap owns the policy and LambdaPull (ecr.tf) already allows
+  # lambda.amazonaws.com. The live checkpoint confirms that CreateFunction works without it.
   statement {
-    sid       = "Ec2SgsForTaggedVpc"
-    effect    = "Allow"
-    actions   = ["ec2:GetSecurityGroupsForVpc"]
-    resources = [local.ec2_type_arn["vpc"]]
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:ResourceTag/Project"
-      values   = [local.tag_project]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "aws:ResourceTag/Env"
-      values   = [var.env]
-    }
-  }
-
-  statement {
-    sid       = "ElbRead"
-    effect    = "Allow"
-    actions   = ["elasticloadbalancing:Describe*"]
-    resources = ["*"] # No resource-level support for Describe
-  }
-
-  statement {
-    sid    = "ElbManage"
+    sid    = "EcrReadOneRepo"
     effect = "Allow"
     actions = [
-      "elasticloadbalancing:CreateLoadBalancer",
-      "elasticloadbalancing:DeleteLoadBalancer",
-      "elasticloadbalancing:ModifyLoadBalancerAttributes",
-      "elasticloadbalancing:SetSecurityGroups",
-      "elasticloadbalancing:SetSubnets",
-      "elasticloadbalancing:CreateTargetGroup",
-      "elasticloadbalancing:DeleteTargetGroup",
-      "elasticloadbalancing:ModifyTargetGroup",
-      "elasticloadbalancing:ModifyTargetGroupAttributes",
-      "elasticloadbalancing:CreateListener",
-      "elasticloadbalancing:DeleteListener",
-      "elasticloadbalancing:ModifyListener",
-      "elasticloadbalancing:ModifyListenerAttributes",
-      "elasticloadbalancing:CreateRule",
-      "elasticloadbalancing:DeleteRule",
-      "elasticloadbalancing:ModifyRule",
-      "elasticloadbalancing:AddTags",
-      "elasticloadbalancing:RemoveTags",
-    ]
-    resources = local.elb_arns
-  }
-
-  statement {
-    sid    = "EcsCluster"
-    effect = "Allow"
-    actions = [
-      "ecs:CreateCluster",
-      "ecs:DeleteCluster",
-      "ecs:DescribeClusters",
-      "ecs:UpdateCluster",
-      "ecs:UpdateClusterSettings",
-      "ecs:PutClusterCapacityProviders",
-      "ecs:TagResource",
-      "ecs:UntagResource",
-      "ecs:ListTagsForResource",
-    ]
-    resources = ["${local.svc_arn["ecs"]}:cluster/${local.name}-*"]
-  }
-
-  statement {
-    sid    = "EcsService"
-    effect = "Allow"
-    actions = [
-      "ecs:CreateService",
-      "ecs:UpdateService",
-      "ecs:DeleteService",
-      "ecs:DescribeServices",
-      "ecs:TagResource",
-      "ecs:UntagResource",
-      "ecs:ListTagsForResource",
-    ]
-    resources = ["${local.svc_arn["ecs"]}:service/${local.resource_names.ecs_cluster}/*"]
-  }
-
-  # Cost guard: task size is capped on registration (B18).
-  statement {
-    sid       = "EcsTaskDefRegister"
-    effect    = "Allow"
-    actions   = ["ecs:RegisterTaskDefinition"]
-    resources = ["${local.svc_arn["ecs"]}:task-definition/${local.name}-*:*"]
-
-    condition {
-      test     = "NumericLessThanEquals"
-      variable = "ecs:task-cpu"
-      values   = ["512"]
-    }
-
-    condition {
-      test     = "NumericLessThanEquals"
-      variable = "ecs:task-memory"
-      values   = ["1024"]
-    }
-  }
-
-  statement {
-    sid       = "EcsTaskDefTags"
-    effect    = "Allow"
-    actions   = ["ecs:TagResource", "ecs:ListTagsForResource"]
-    resources = ["${local.svc_arn["ecs"]}:task-definition/${local.name}-*:*"]
-  }
-
-  statement {
-    sid       = "EcsTaskDefUnscoped"
-    effect    = "Allow"
-    actions   = ["ecs:DescribeTaskDefinition", "ecs:DeregisterTaskDefinition"]
-    resources = ["*"] # No resource-level support
-  }
-
-  statement {
-    sid    = "Ecr"
-    effect = "Allow"
-    actions = [
-      "ecr:CreateRepository",
-      "ecr:DeleteRepository",
-      "ecr:DescribeRepositories",
       "ecr:DescribeImages",
-      "ecr:PutImageScanningConfiguration",
-      "ecr:PutImageTagMutability",
-      "ecr:PutLifecyclePolicy",
-      "ecr:GetLifecyclePolicy",
-      "ecr:DeleteLifecyclePolicy",
+      "ecr:DescribeRepositories",
+      "ecr:BatchGetImage",
+      "ecr:GetDownloadUrlForLayer",
       "ecr:GetRepositoryPolicy",
-      "ecr:SetRepositoryPolicy",
-      "ecr:DeleteRepositoryPolicy",
-      "ecr:TagResource",
-      "ecr:UntagResource",
-      "ecr:ListTagsForResource",
     ]
-    resources = [local.ecr_repo_pattern]
+    resources = [local.ecr_repo_app]
   }
 
+  # HTTP API, integration, route and stage (L2). API Gateway authorizes by HTTP verb on the resource path. API IDs
+  # are random, so the paths are every HTTP API of this region; tags are written through POST/DELETE on /tags/*.
+  statement {
+    sid    = "ApiGatewayHttpApi"
+    effect = "Allow"
+    actions = [
+      "apigateway:GET",
+      "apigateway:POST",
+      "apigateway:PUT",
+      "apigateway:PATCH",
+      "apigateway:DELETE",
+    ]
+    resources = [
+      "${local.apigateway_arn}/apis",
+      "${local.apigateway_arn}/apis/*",
+      "${local.apigateway_arn}/tags/*",
+    ]
+  }
+
+  # The two log groups (L10): the function's and the HTTP API access log.
   statement {
     sid    = "Logs"
     effect = "Allow"
@@ -395,14 +148,47 @@ data "aws_iam_policy_document" "apply" {
     resources = local.log_group_arns
   }
 
+  # API Gateway HTTP API access logging permissions: the caller that sets access_log_settings on a stage needs the
+  # CloudWatch Logs vended-delivery actions. CreateLogDelivery, GetLogDelivery, UpdateLogDelivery,
+  # DeleteLogDelivery, ListLogDeliveries, PutResourcePolicy, DescribeResourcePolicies and DescribeLogGroups are
+  # believed to support no resource-level permissions, so they take "*". Accepted risk: the Service Authorization
+  # Reference could not be opened offline to confirm the resource types; re-check it at the live checkpoint and
+  # scope any action that does support a resource (PutResourcePolicy can widen log group access account-wide).
   statement {
-    sid       = "LogsRead"
-    effect    = "Allow"
-    actions   = ["logs:DescribeLogGroups"]
-    resources = ["*"] # No resource-level support
+    sid    = "LogsDeliveryUnscoped"
+    effect = "Allow"
+    actions = [
+      "logs:CreateLogDelivery",
+      "logs:GetLogDelivery",
+      "logs:UpdateLogDelivery",
+      "logs:DeleteLogDelivery",
+      "logs:ListLogDeliveries",
+      "logs:PutResourcePolicy",
+      "logs:DescribeResourcePolicies",
+      "logs:DescribeLogGroups",
+    ]
+    resources = ["*"] # No resource-level support (see above)
   }
 
-  # Secret shells only: G1 denies reading or writing values.
+  # The three alarms (L10), all named <prefix>-<env>-*.
+  statement {
+    sid    = "CloudWatchAlarms"
+    effect = "Allow"
+    actions = [
+      "cloudwatch:PutMetricAlarm",
+      "cloudwatch:DeleteAlarms",
+      "cloudwatch:DescribeAlarms",
+      "cloudwatch:TagResource",
+      "cloudwatch:UntagResource",
+      "cloudwatch:ListTagsForResource",
+    ]
+    resources = ["${local.svc_arn["cloudwatch"]}:alarm:${local.name}-*"]
+  }
+
+  # Secret shells only. Guardrail G1 denies reading values (GetSecretValue, BatchGetSecretValue) and PutSecretValue,
+  # but CreateSecret and UpdateSecret accept SecretString, so this role could still write a value through them.
+  # Accepted risk (ADR 0002 R1): the module never sets one (no secret version resource, tf/policy.sh rule 1), and a
+  # value written this way could not be read back by any CI role.
   statement {
     sid    = "SecretShell"
     effect = "Allow"
@@ -418,19 +204,25 @@ data "aws_iam_policy_document" "apply" {
     resources = [local.secret_pattern]
   }
 
-  # Roles can only be created or changed with the boundary attached (B15).
+  # IAM on the execution role, exact ARN only (not a <name>-app-* pattern: the module creates one role, and a
+  # wildcard role pattern fails the M1 test). Each condition sits only on actions that support its key: an action
+  # without iam:PermissionsBoundary in its request context would never match a StringEquals on it and would be
+  # implicitly denied.
+
+  # The role can only be created or given policies with the boundary attached (B15, L9). Per the IAM Service
+  # Authorization Reference, iam:PermissionsBoundary is supported by CreateRole, PutRolePolicy, DeleteRolePolicy,
+  # PutRolePermissionsBoundary (and AttachRolePolicy, DetachRolePolicy, DeleteRolePermissionsBoundary, which this
+  # role does not hold or is denied).
   statement {
-    sid    = "IamEcsRolesBounded"
+    sid    = "IamAppRoleBounded"
     effect = "Allow"
     actions = [
       "iam:CreateRole",
       "iam:PutRolePolicy",
       "iam:DeleteRolePolicy",
       "iam:PutRolePermissionsBoundary",
-      "iam:UpdateAssumeRolePolicy",
-      "iam:DeleteRole",
     ]
-    resources = local.ecs_role_arns
+    resources = [local.app_exec_role_arn]
 
     condition {
       test     = "StringEquals"
@@ -439,8 +231,38 @@ data "aws_iam_policy_document" "apply" {
     }
   }
 
+  # Trust change and delete. Neither supports iam:PermissionsBoundary (not in the reference's list above; re-check
+  # at the live checkpoint), so a boundary condition here would not constrain them, it would only deny them.
+  # UpdateAssumeRolePolicy could give the role a foreign trust: the boundary still caps the role, and its secret
+  # read requires lambda:SourceFunctionArn of this env's function (iam_app_boundary.tf), which a request from
+  # outside the function never carries. DeleteRole only removes the role; DenyBoundaryRemoval stays in force.
   statement {
-    sid    = "IamEcsRolesRead"
+    sid    = "IamAppRoleTrustAndDelete"
+    effect = "Allow"
+    actions = [
+      "iam:UpdateAssumeRolePolicy",
+      "iam:DeleteRole",
+    ]
+    resources = [local.app_exec_role_arn]
+  }
+
+  # Tags, description and maximum session duration. TagRole, UntagRole, UpdateRole and UpdateRoleDescription do not
+  # support iam:PermissionsBoundary either. None of them can widen what the role may do, and the boundary still caps
+  # the role whatever its tags or description say.
+  statement {
+    sid    = "IamAppRoleMetadata"
+    effect = "Allow"
+    actions = [
+      "iam:TagRole",
+      "iam:UntagRole",
+      "iam:UpdateRole",
+      "iam:UpdateRoleDescription",
+    ]
+    resources = [local.app_exec_role_arn]
+  }
+
+  statement {
+    sid    = "IamAppRoleRead"
     effect = "Allow"
     actions = [
       "iam:GetRole",
@@ -449,37 +271,36 @@ data "aws_iam_policy_document" "apply" {
       "iam:ListAttachedRolePolicies",
       "iam:ListInstanceProfilesForRole",
       "iam:ListRoleTags",
-      "iam:TagRole",
-      "iam:UntagRole",
-      "iam:UpdateRole",
-      "iam:UpdateRoleDescription",
     ]
-    resources = local.ecs_role_arns
+    resources = [local.app_exec_role_arn]
   }
 
+  # CreateFunction and UpdateFunctionConfiguration with a Role need PassRole (Finding 9): the one execution role,
+  # to Lambda only.
   statement {
-    sid       = "PassEcsRoles"
+    sid       = "PassAppExecRole"
     effect    = "Allow"
     actions   = ["iam:PassRole"]
-    resources = local.ecs_role_arns
+    resources = [local.app_exec_role_arn]
 
     condition {
       test     = "StringEquals"
       variable = "iam:PassedToService"
-      values   = ["ecs-tasks.amazonaws.com"]
+      values   = ["lambda.amazonaws.com"]
     }
   }
 
+  # API Gateway creates its service-linked role on first use in an account.
   statement {
     sid       = "ServiceLinkedRoles"
     effect    = "Allow"
     actions   = ["iam:CreateServiceLinkedRole"]
-    resources = ["${local.iam_arn}:role/aws-service-role/ecs.amazonaws.com/*", "${local.iam_arn}:role/aws-service-role/elasticloadbalancing.amazonaws.com/*"]
+    resources = ["${local.iam_arn}:role/aws-service-role/ops.apigateway.amazonaws.com/*"]
 
     condition {
       test     = "StringEquals"
       variable = "iam:AWSServiceName"
-      values   = ["ecs.amazonaws.com", "elasticloadbalancing.amazonaws.com"]
+      values   = ["ops.apigateway.amazonaws.com"]
     }
   }
 

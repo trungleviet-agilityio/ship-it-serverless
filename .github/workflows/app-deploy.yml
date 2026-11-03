@@ -1,14 +1,24 @@
-# App deploy to dev (PLAN Phase 4, ADR 0005, FR-11, FR-14, FR-15).
-# A push to main (or a manual run on main) builds the image once, smoke tests and scans it, pushes it to the dev ECR
-# by an immutable tag, registers a task definition revision that references the image digest, updates the ECS
-# service and waits for the rollout. The file path is part of the deploy role trust (ADR 0007 S2): the bootstrap
-# `workflow_files` must list app-deploy.yml.
-# Two jobs, because `id-token` and `environment` apply to every step of a job: `build-scan` runs the build, the
-# smoke test and the scan with no token, no environment and no secret (F9); `deploy` loads exactly the bytes that
-# job produced (sha256 checked) and is the only job that can assume the deploy role.
-# Jobs that assume an AWS role run harden-runner in block mode with telemetry off and an exact allowlist (ADR 0007 S39).
-# Hosts holding the account ID come from secret expressions, never literals. A blocked host fails the job: read its
-# name in the log, add it here (the repo-guard workflow enforces the shape).
+# App deploy to dev (ADR 0012 L7, L8; ADR 0005; FR-11, FR-14, FR-15).
+# A push to main (or a manual run on main) builds the image once, smoke tests and scans it, pushes it to the dev ECR by
+# an immutable tag (crane, no Docker), then releases it on Lambda: UpdateFunctionCode by digest, IMAGE_DIGEST and the
+# description set, PublishVersion, a smoke invoke of that version (no traffic yet), then the alias `live` moves all at
+# once or through an alias-weighted canary (probes invoke the alias through the Lambda API). Old versions are pruned.
+# The file path is part of the deploy role trust (ADR 0007 S2): the bootstrap `workflow_files` must list app-deploy.yml.
+# The strategy of a push comes from the dev environment variables RELEASE_STRATEGY, CANARY_PERCENT and BAKE_MINUTES
+# (empty: all at once); a dispatch input wins (scripts/lambda/release-inputs.sh).
+# A manual run with mode rollback skips the build: a credential-free gate first proves the requested commit was green in
+# dev (scripts/image/promote-resolve.sh, as in app-promote), then the run releases the image ECR already holds for it
+# and reuses that commit's version when it still exists (scripts/lambda/publish.sh).
+# The function is created by terraform-iac from an image that is already in ECR (ADR 0012 L3): on the first run of the
+# environment the deploy pushes, then stops green with a notice until the apply has created the function.
+# Jobs, because `id-token` and `environment` apply to every step of a job: `build-scan` runs the build, the smoke test
+# and the scan with no token, no environment and no secret (F9); `resolve` (rollback only) checks the commit with git
+# and the GitHub API only; `deploy` pushes exactly the bytes build-scan produced (sha256 checked) and is the only job
+# that can assume the deploy role; `verify` reads /version through the HTTP API with no token, no environment and no
+# secret, so no credentialed job ever needs an execute-api host (ADR 0012 L7, review M1).
+# Jobs that assume an AWS role run harden-runner in block mode with telemetry off, sudo and containers off and an exact
+# allowlist (ADR 0007 S39). Hosts holding the account ID come from secret expressions, never literals. A blocked host
+# fails the job: read its name in the log, add it here (the repo-guard workflow enforces the shape).
 name: App Deploy
 run-name: Deploy ${{ github.ref_name }} to dev by ${{ github.actor }}
 
@@ -27,17 +37,48 @@ on:
       - scripts/aws/check-config.sh
       - scripts/ci/tools.sha256
       - scripts/image/ecr-push.sh
-      - scripts/ecs/preflight.sh
-      - scripts/ecs/wait-deployment.sh
       - scripts/image/export.sh
-      - scripts/image/import.sh
+      - scripts/image/promote-resolve.sh
       - scripts/image/verify.sh
       - scripts/ci/install-tools.sh
-      - scripts/ecs/render-task-def.sh
       - scripts/image/scan.sh
+      - scripts/lambda/release-inputs.sh
+      - scripts/lambda/preflight.sh
+      - scripts/lambda/resolve-image.sh
+      - scripts/lambda/publish.sh
+      - scripts/lambda/smoke-invoke.sh
+      - scripts/lambda/api-endpoint.sh
+      - scripts/lambda/shift-alias.sh
+      - scripts/lambda/canary-bake.sh
+      - scripts/lambda/verify-live.sh
+      - scripts/lambda/prune-versions.sh
       - mise.toml
-  # Deploys main HEAD, for example after the dev stack was re-created. Both jobs refuse any other ref.
+  # Deploys main HEAD (mode deploy), for example with a canary, or rolls dev back to an earlier commit (mode rollback).
+  # Both jobs refuse any other ref.
   workflow_dispatch:
+    inputs:
+      mode:
+        description: deploy builds main HEAD; rollback releases the image of an earlier commit (set sha)
+        type: choice
+        options: [deploy, rollback]
+        default: deploy
+      strategy:
+        description: all-at-once moves live at once; canary sends canary_percent to the new version for bake_minutes first
+        type: choice
+        options: [all-at-once, canary]
+        default: all-at-once
+      canary_percent:
+        description: Canary weight in percent (1 to 50)
+        type: string
+        default: "10"
+      bake_minutes:
+        description: Canary bake time in minutes (1 to 30)
+        type: string
+        default: "5"
+      sha:
+        description: Rollback only. Full 40 hex commit that had a green deploy (dev) and verify (dev) run on main
+        type: string
+        default: ""
 
 permissions: {}
 
@@ -49,8 +90,8 @@ env:
 jobs:
   build-scan:
     name: build, scan
-    # Only main builds for a deploy: a branch run would build an image nobody may deploy.
-    if: github.ref == 'refs/heads/main'
+    # Only main builds for a deploy: a branch run would build an image nobody may deploy. A rollback builds nothing.
+    if: github.ref == 'refs/heads/main' && inputs.mode != 'rollback'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     # No OIDC token, no deployment environment, no secrets: nothing in this job can reach AWS (the CI self-tests check it).
@@ -72,8 +113,8 @@ jobs:
       - name: Install trivy (checksum verified)
         run: scripts/ci/install-tools.sh "$RUNNER_TEMP/tools" trivy
 
-      # Build (the unit tests run inside), smoke test like Fargate, scan. A fixable HIGH or CRITICAL finding blocks
-      # the deploy (ADR 0005, Q4).
+      # Build (the unit tests run inside), smoke test like Lambda/compose, scan. A fixable HIGH or CRITICAL finding
+      # blocks the deploy (ADR 0005, Q4).
       - name: Build, smoke test and scan the image
         run: scripts/image/verify.sh "$GIT_SHA" "$RUNNER_TEMP/scan"
 
@@ -90,12 +131,47 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+  # Rollback only: the commit must be on main and have a green `deploy (dev)` and `verify (dev)` run of its own, exactly
+  # the check app-promote's `resolve` job runs (ADR 0012 L8).
+  resolve:
+    name: resolve (green in dev)
+    if: github.ref == 'refs/heads/main' && inputs.mode == 'rollback'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # No OIDC token, no deployment environment, no secrets: this job cannot reach AWS.
+    permissions:
+      contents: read
+      actions: read # gh run list: the app-deploy run of the SHA
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
+
+      # The full history: the SHA must be an ancestor of origin/main.
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Require a green dev deploy of the SHA
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ inputs.sha }}
+        run: scripts/image/promote-resolve.sh "$SHA"
+
   deploy:
     name: deploy (dev)
-    needs: build-scan
-    if: github.ref == 'refs/heads/main'
+    needs: [build-scan, resolve]
+    # A deploy needs a green build-scan (resolve is skipped); a rollback needs a green resolve (build-scan is skipped).
+    if: >-
+      !cancelled()
+      && github.ref == 'refs/heads/main'
+      && ((inputs.mode != 'rollback' && needs.build-scan.result == 'success' && needs.resolve.result == 'skipped')
+        || (inputs.mode == 'rollback' && needs.build-scan.result == 'skipped' && needs.resolve.result == 'success'))
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     # The environment adds the required reviewer and sets the OIDC subject the deploy role trusts. Its name cannot
     # come from `env`: the environments context is not available here.
     environment: dev
@@ -107,20 +183,33 @@ jobs:
     permissions:
       contents: read
       id-token: write # OIDC token for the role assumed by configure-aws-credentials
+    # The verify job reads these. None holds an account ID; release-inputs.sh, ecr-push.sh and api-endpoint.sh have
+    # validated each value, and verify-live.sh validates them again.
+    outputs:
+      released: ${{ steps.release.outputs.released }}
+      sha: ${{ steps.release.outputs.sha }}
+      digest: ${{ steps.release.outputs.digest }}
+      api-endpoint: ${{ steps.release.outputs.api-endpoint }}
     steps:
+      # No execute-api host: the canary probes invoke the alias through the Lambda API, and /version through the HTTP API
+      # is read by the verify job, which holds no credentials (ADR 0012 L7, review M1).
       - name: Harden runner
         uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
         with:
           egress-policy: block
           disable-telemetry: true
-          # No disable-sudo-and-containers: this job runs docker load and docker push (named exception in the policy).
+          # crane pushes the image archive registry-side: no Docker, so sudo and containers stay off.
+          disable-sudo-and-containers: true
           allowed-endpoints: >
             github.com:443
+            release-assets.githubusercontent.com:443
             sts.${{ vars.AWS_REGION }}.amazonaws.com:443
             api.ecr.${{ vars.AWS_REGION }}.amazonaws.com:443
             ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ vars.AWS_REGION }}.amazonaws.com:443
             prod-${{ vars.AWS_REGION }}-starport-layer-bucket.s3.${{ vars.AWS_REGION }}.amazonaws.com:443
-            ecs.${{ vars.AWS_REGION }}.amazonaws.com:443
+            lambda.${{ vars.AWS_REGION }}.amazonaws.com:443
+            apigateway.${{ vars.AWS_REGION }}.amazonaws.com:443
+            monitoring.${{ vars.AWS_REGION }}.amazonaws.com:443
             secretsmanager.${{ vars.AWS_REGION }}.amazonaws.com:443
 
       - name: Check out the repository
@@ -128,20 +217,33 @@ jobs:
         with:
           persist-credentials: false
 
+      # Before any input is used: the dispatch inputs and the environment variables reach the script through env only. A
+      # push has no inputs, so the dev environment variables (or the defaults) choose the strategy.
+      - name: Validate the release inputs
+        env:
+          MODE: ${{ inputs.mode }}
+          STRATEGY: ${{ inputs.strategy }}
+          CANARY_PERCENT: ${{ inputs.canary_percent }}
+          BAKE_MINUTES: ${{ inputs.bake_minutes }}
+          SHA: ${{ inputs.sha }}
+          RELEASE_STRATEGY: ${{ vars.RELEASE_STRATEGY }}
+          VARS_CANARY_PERCENT: ${{ vars.CANARY_PERCENT }}
+          VARS_BAKE_MINUTES: ${{ vars.BAKE_MINUTES }}
+        run: scripts/lambda/release-inputs.sh >> "$GITHUB_ENV"
+
       - name: Derive the resource names
         run: scripts/names.sh app >> "$GITHUB_ENV"
 
       - name: Download the image
+        if: env.RELEASE_MODE == 'deploy'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: app-image
           path: ${{ runner.temp }}/image
 
-      # The sha256 comes from the build job output, not from the artifact, so a replaced artifact is refused.
-      - name: Load the image (sha256 verified)
-        env:
-          EXPECTED_SHA256: ${{ needs.build-scan.outputs.image-sha256 }}
-        run: scripts/image/import.sh "$RUNNER_TEMP/image/image.tar" "$EXPECTED_SHA256"
+      - name: Install crane (checksum verified)
+        if: env.RELEASE_MODE == 'deploy'
+        run: scripts/ci/install-tools.sh "$RUNNER_TEMP/tools" crane
 
       - name: Check configuration
         env:
@@ -159,47 +261,119 @@ jobs:
           mask-aws-account-id: true
           retry-max-attempts: 3
 
-      # Fail rather than skip, so a green run always means "deployed" (ADR 0005, F16, Q2). Also N4: the deploy
-      # role must be denied the secret value.
-      - name: Preflight (the stack is up, N4)
-        run: scripts/ecs/preflight.sh
+      # The function is Active, the secret has a value, and the deploy role is denied it (N4). Exit code 3 means the
+      # function does not exist yet (first run of the environment): a deploy still pushes, a rollback fails.
+      - name: Preflight (function ready, secret set, N4)
+        id: preflight
+        run: |
+          set -euo pipefail
+          rc=0
+          scripts/lambda/preflight.sh || rc=$?
+          case "$rc" in
+            0) echo "function=present" >> "$GITHUB_OUTPUT" ;;
+            3)
+              if [[ "$RELEASE_MODE" != "deploy" ]]; then
+                echo "::error::nothing to roll back: the function ${FUNCTION} does not exist"
+                exit 1
+              fi
+              echo "function=missing" >> "$GITHUB_OUTPUT"
+              ;;
+            *) exit "$rc" ;;
+          esac
 
-      # Push once, by immutable tag; a re-run reuses the image that was scanned. The digest comes from ECR.
+      # Push once, by immutable tag, with crane from the archive; a re-run reuses the image that was scanned. The sha256
+      # comes from the build job output, not from the artifact, so a replaced artifact is refused. The digest comes from
+      # ECR. promote-resolve.sh requires this step by name: it tells a deploy run from a rollback run.
       - name: Push the image to ECR
+        if: env.RELEASE_MODE == 'deploy'
         env:
           ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID }}
           REGION: ${{ vars.AWS_REGION }}
-        run: scripts/image/ecr-push.sh "$REPOSITORY" "$GIT_SHA" "$(scripts/names.sh image "$GIT_SHA")" >> "$GITHUB_ENV"
+          EXPECTED_SHA256: ${{ needs.build-scan.outputs.image-sha256 }}
+        run: scripts/image/ecr-push.sh "$REPOSITORY" "$TARGET_SHA" "$RUNNER_TEMP/image/image.tar" "$EXPECTED_SHA256" "$RUNNER_TEMP" >> "$GITHUB_ENV"
 
-      # Terraform owns the shape of the task definition; this step replaces only the image (ADR 0005, F2 to F4).
-      - name: Render the task definition
+      # Rollback: the digest ECR holds under the tag of the requested commit (pushed by an earlier run).
+      - name: Resolve the rollback image
+        if: env.RELEASE_MODE == 'rollback'
+        run: scripts/lambda/resolve-image.sh "$TARGET_SHA" >> "$GITHUB_ENV"
+
+      - name: Stop until the function exists
+        if: steps.preflight.outputs.function == 'missing'
+        run: |
+          echo "::notice::function ${FUNCTION} not created yet: the image is in ECR; run terraform-iac apply for ${ENV}, then app-deploy (Run workflow)"
+          echo "Function \`${FUNCTION}\` not created yet: image pushed, nothing released. Run terraform-iac apply for ${ENV}, then app-deploy." >> "$GITHUB_STEP_SUMMARY"
+
+      # Code by digest, IMAGE_DIGEST, PublishVersion; or the existing version of this commit and digest (rollback).
+      - name: Publish the version
+        id: publish
+        if: steps.preflight.outputs.function == 'present'
+        env:
+          ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID }}
+          REGION: ${{ vars.AWS_REGION }}
+        run: scripts/lambda/publish.sh "${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com/${REPOSITORY}" "$IMAGE_DIGEST" "$TARGET_SHA" >> "$GITHUB_OUTPUT"
+
+      # The new version answers /health and /version before it gets any traffic.
+      - name: Smoke-invoke the version
+        if: steps.preflight.outputs.function == 'present'
+        env:
+          VERSION: ${{ steps.publish.outputs.VERSION }}
+        run: scripts/lambda/smoke-invoke.sh "$VERSION" "$TARGET_SHA" "$IMAGE_DIGEST"
+
+      - name: Find the API endpoint
+        id: api
+        if: steps.preflight.outputs.function == 'present'
+        run: scripts/lambda/api-endpoint.sh >> "$GITHUB_OUTPUT"
+
+      # A version that is already the primary is a no-op (shift-alias.sh prints a notice).
+      - name: Move live to the version (all at once)
+        if: steps.preflight.outputs.function == 'present' && env.STRATEGY == 'all-at-once'
+        env:
+          VERSION: ${{ steps.publish.outputs.VERSION }}
+        run: scripts/lambda/shift-alias.sh "$VERSION"
+
+      # Weight, bake (probes invoke the alias `live`), then 100 percent. A failed bake fails the step; the next step
+      # removes the weight. A version that is already the primary gets no weight and no bake.
+      - name: Canary, bake, then move live
+        id: canary
+        if: steps.preflight.outputs.function == 'present' && env.STRATEGY == 'canary'
+        env:
+          VERSION: ${{ steps.publish.outputs.VERSION }}
         run: |
           set -euo pipefail
-          aws ecs describe-task-definition --task-definition "$FAMILY" --query taskDefinition --output json \
-            >"$RUNNER_TEMP/td-current.json"
-          scripts/ecs/render-task-def.sh --env "$ENV" "$RUNNER_TEMP/td-current.json" "$IMAGE_REF" "$GIT_SHA" >"$RUNNER_TEMP/td.json"
-          echo "Rendered a new revision of ${FAMILY} for image ${IMAGE_DIGEST}"
+          shifted="$(scripts/lambda/shift-alias.sh "$VERSION" --weight "$CANARY_PERCENT")"
+          if grep -qx 'ALIAS_CHANGED=false' <<<"$shifted"; then
+            echo "canary=skipped" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          scripts/lambda/canary-bake.sh "$VERSION" "$BAKE_MINUTES" >> "$GITHUB_OUTPUT"
+          scripts/lambda/shift-alias.sh "$VERSION"
 
-      - name: Register the task definition
+      # Runs when the canary step failed or the run was cancelled during the bake: the old version keeps 100 percent.
+      - name: Abort the canary
+        if: always() && (steps.canary.outcome == 'failure' || steps.canary.outcome == 'cancelled')
+        run: |
+          echo "::error::canary of the new version failed: removing its weight; the previous version keeps all traffic"
+          scripts/lambda/shift-alias.sh --clear-weights
+
+      # Hands the release to the verify job. Runs only when every release step above succeeded.
+      - name: Hand the release to verify
+        id: release
+        if: steps.preflight.outputs.function == 'present'
+        env:
+          API_ENDPOINT: ${{ steps.api.outputs.API_ENDPOINT }}
         run: |
           set -euo pipefail
-          td_arn="$(aws ecs register-task-definition --cli-input-json "file://$RUNNER_TEMP/td.json" \
-            --query taskDefinition.taskDefinitionArn --output text)"
-          echo "TD_ARN=${td_arn}" >> "$GITHUB_ENV"
-          echo "Registered ${td_arn##*/}"
+          {
+            echo "released=true"
+            echo "sha=${TARGET_SHA}"
+            echo "digest=${IMAGE_DIGEST}"
+            echo "api-endpoint=${API_ENDPOINT}"
+          } >> "$GITHUB_OUTPUT"
 
-      # Always with the revision ARN: Terraform ignores task_definition changes, and the deploy role may only
-      # update this service to a revision of this family.
-      - name: Update the service
-        run: |
-          set -euo pipefail
-          aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" --task-definition "$TD_ARN" \
-            --query "service.deployments[?status=='PRIMARY'].id" --output text >/dev/null
-          echo "Update started for ${TD_ARN##*/}"
-
-      # Not the AWS CLI stability waiter: it also succeeds after a circuit-breaker rollback (ADR 0005, Finding 2).
-      - name: Wait for the rollout
-        run: scripts/ecs/wait-deployment.sh "$CLUSTER" "$SERVICE" "$TD_ARN"
+      - name: Prune old versions
+        id: prune
+        if: steps.preflight.outputs.function == 'present'
+        run: scripts/lambda/prune-versions.sh >> "$GITHUB_OUTPUT"
 
       # configure-aws-credentials masks the assumed-role ARN in logs, so the summary shows the role name (the helper
       # leaves the session name out: it carries the run ID). The Trivy result is in the build-scan job summary.
@@ -208,22 +382,71 @@ jobs:
         env:
           ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID }}
           JOB_STATUS: ${{ job.status }}
+          FUNCTION_STATE: ${{ steps.preflight.outputs.function }}
+          VERSION: ${{ steps.publish.outputs.VERSION }}
+          REUSED: ${{ steps.publish.outputs.REUSED }}
+          CANARY_SKIPPED: ${{ steps.canary.outputs.canary }}
+          CANARY_HITS: ${{ steps.canary.outputs.CANARY_NEW_HITS }}
+          CANARY_FAILED_PROBES: ${{ steps.canary.outputs.CANARY_FAILED_PROBES }}
+          CANARY_ERRORS: ${{ steps.canary.outputs.CANARY_ERRORS }}
+          PRUNED: ${{ steps.prune.outputs.PRUNED }}
         run: |
           set -euo pipefail
-          revision="not registered"
-          if [[ -n "${TD_ARN:-}" ]]; then
-            revision="${TD_ARN##*/}"
+          case "${REUSED:-}" in
+            true) version="${VERSION} (reused)" ;;
+            false) version="${VERSION} (published)" ;;
+            *) version="not published" ;;
+          esac
+          if [[ "${FUNCTION_STATE:-}" == "missing" ]]; then
+            version="not published (the function does not exist yet: run terraform-iac apply)"
+          fi
+          canary="not run"
+          if [[ "${STRATEGY:-}" == "canary" ]]; then
+            canary="${CANARY_PERCENT:-?}% for ${BAKE_MINUTES:-?} min, probes on the new version ${CANARY_HITS:-not known}, failed probes ${CANARY_FAILED_PROBES:-not known}, errors ${CANARY_ERRORS:-not known}"
+            if [[ "${CANARY_SKIPPED:-}" == "skipped" ]]; then canary="skipped (the version was already live)"; fi
           fi
           role="$(scripts/names.sh role 2>/dev/null)" || role="not assumed"
           {
-            echo "### app-deploy"
-            echo "Commit: \`${GIT_SHA}\`"
-            echo "Image digest: \`${IMAGE_DIGEST:-not pushed}\`"
-            echo "Task definition: \`${revision}\`"
-            echo "Result: ${JOB_STATUS}"
+            echo "### app-deploy (${RELEASE_MODE:-not validated})"
+            echo "Commit: \`${TARGET_SHA:-${GIT_SHA}}\`"
+            echo "Image digest: \`${IMAGE_DIGEST:-not resolved}\`"
+            echo "Version: ${version}"
+            echo "Strategy: ${STRATEGY:-not validated}; canary: ${canary}"
+            echo "Versions pruned: ${PRUNED:-not run}"
+            echo "Result: ${JOB_STATUS} (the verify job reads /version through the API next)"
             echo "Role: \`${role}\`"
           } | scripts/aws/assert-no-account-id.sh >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Remove the image and task definition files
+      - name: Remove the image files
         if: always()
-        run: rm -rf "$RUNNER_TEMP/image" "$RUNNER_TEMP/td-current.json" "$RUNNER_TEMP/td.json"
+        run: rm -rf "$RUNNER_TEMP/image"
+
+  # The front-door check (ADR 0012 L6, L7; review M1): GET /version through the HTTP API must show the released commit
+  # and digest. No OIDC token, no deployment environment, no secrets, so this is the only job that may talk to an
+  # execute-api host, and harden-runner stays in audit like every job without credentials.
+  verify:
+    name: verify (dev)
+    needs: deploy
+    if: needs.deploy.outputs.released == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
+
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # verify-live.sh matches the endpoint against the API endpoint pattern before any request.
+      - name: Verify live through the API
+        env:
+          API_ENDPOINT: ${{ needs.deploy.outputs.api-endpoint }}
+          RELEASED_SHA: ${{ needs.deploy.outputs.sha }}
+          RELEASED_DIGEST: ${{ needs.deploy.outputs.digest }}
+        run: scripts/lambda/verify-live.sh "$API_ENDPOINT" "$RELEASED_SHA" "$RELEASED_DIGEST"

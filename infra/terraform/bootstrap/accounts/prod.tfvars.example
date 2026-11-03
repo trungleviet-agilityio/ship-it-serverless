@@ -7,5 +7,8 @@ github_repo_id  = "<REPO_ID>"  # gh api repos/OWNER/REPO --jq .id
 # The bootstrap default is dev: every other environment must set env.
 env = "prod"
 
-# Promotion source (ADR 0008 P9): the deploy role may pull from sis-dev-app there, and trusts app-promote.yml.
+# Promotion source (ADR 0008 P9): the deploy role may pull from <prefix>-dev-app there, and trusts app-promote.yml.
 promotion_source_account_id = "<DEV_ACCOUNT_ID>"
+
+# Prod is the end of the promotion path: leave promotion_target_account_id unset, so its repository policy has
+# LambdaPull only (ADR 0012 L4).

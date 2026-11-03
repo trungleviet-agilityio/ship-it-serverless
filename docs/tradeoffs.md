@@ -81,6 +81,13 @@ column, "Would change my mind", says what would flip the decision on a real prod
 | All at once only | Simplest | Nothing to learn about canaries | Internal tools |
 | Two functions (blue and green) behind the API | Full isolation | Double cost and config; aliases already solve it | Different IAM per color |
 
+How the canary judges (after review): probes invoke the alias directly with `lambda invoke --qualifier live`, so the
+weights apply and each response names the version that served it. A probe through the public API would need the
+deploy job to allow an `*.execute-api` host, which matches every account's API and would give deploy credentials
+an exit path. The judgment is the HTTP status inside each payload served by the new version: with the Web Adapter an
+app 500 is a successful invoke, so the `Errors` metric only sees crashes and timeouts and stays a second signal.
+The public front door is still checked, by a separate job that holds no credentials.
+
 Why the smoke invoke matters: Lambda has no health check like an ALB target group. LWA waits for `/health` to
 answer before the first request, so a version whose `/health` fails never serves a request. Invoking the
 **version** (not the alias) proves that before any user sees it.
@@ -144,3 +151,21 @@ start time (tens of seconds, but once per deploy).
 - Image code signing (not supported for Lambda images).
 - Long requests (HTTP API about 30 s).
 - One image runs everywhere, as before, but `/version` digest now depends on the deploy writing `IMAGE_DIGEST`.
+
+## 16. Who can reach the secret value
+
+| Path | Possible? | Control |
+|---|---|---|
+| A CI role calls `GetSecretValue` | No | Guardrail G1 denies it on every CI role |
+| The apply role re-creates the execution role with a foreign trust | Can re-create it, cannot read with it | The read is allowed only with `lambda:SourceFunctionArn` = this function, in the role policy and the boundary |
+| A plain `APP_API_KEY` planted in the function configuration | Ignored | The app ignores it when `AWS_LAMBDA_FUNCTION_NAME` is set |
+| The deploy role ships code that runs as the execution role | **Yes (accepted risk)** | Main-only trust, pinned workflow file, environment approval, no `PassRole` |
+| The apply role writes a value with `CreateSecret`/`UpdateSecret` | Yes (accepted, ADR 0002 R1) | Same gates as every apply |
+
+## 17. Dependabot and public.ecr.aws
+
+| Option | Pros | Cons |
+|---|---|---|
+| Keep the `docker` ecosystem | Automatic digest bumps | Fails today: Dependabot's proxy cannot authenticate to `public.ecr.aws` (upstream issue dependabot/proxy#157) |
+| Move the Python base to Docker Hub | Dependabot reads Docker Hub | Docker Hub rate limits in CI (the reason the template moved to ECR Public); the Web Adapter is only published on ECR Public, so the run would still fail |
+| **Drop the `docker` ecosystem, monthly manual bump with the `pin-versions` skill** | No failing bot runs; digests still pinned and scanned by Trivy | A manual chore; re-enable when the upstream issue is fixed |

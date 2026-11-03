@@ -5,10 +5,20 @@ All Terraform for the lab. Three kinds of directories, each with its own `README
 | Path | Kind | State | Who applies | Phase |
 |---|---|---|---|---|
 | [`bootstrap/`](bootstrap/) | Root, once per AWS account | `bootstrap/terraform.tfstate` in the account's state bucket | You, locally, with SSO admin | 1 |
-| [`modules/app-ecs/`](modules/app-ecs/) | Module (no provider, no backend) | n/a | Called by `envs/<env>` | 3 |
-| [`envs/dev/`](envs/dev/) | Root, one per environment (copies of `envs/dev`, see below) | `envs/<env>/terraform.tfstate` | CI apply role, after approval | 3 |
+| [`modules/app-lambda/`](modules/app-lambda/) | Module (no provider, no backend) | n/a | Called by `envs/<env>` | 3 |
+| [`envs/dev/`](envs/dev/), [`envs/prod/`](envs/prod/) | Root, one per environment (copies of `envs/dev`, see below) | `envs/<env>/terraform.tfstate` | CI apply role, after approval | 3 |
 
-Order: `bootstrap` first (it creates the state bucket and the CI roles), then `envs/<env>`.
+What lives where (ADR 0012):
+
+| Root or module | Owns |
+|---|---|
+| `bootstrap` | State bucket, GitHub OIDC provider, plan, apply and deploy roles, guardrails, the execution role boundary `<prefix>-<env>-app-boundary`, the ECR repository `<prefix>-<env>-app` with its policy (`LambdaPull`, and `PromotionPull` in dev when a promotion target is set), trail, alert topic and budget |
+| `modules/app-lambda` | Function `<prefix>-<env>-app` (image by digest), alias `live`, HTTP API `<prefix>-<env>-api`, the two log groups, three alarms, the secret shell and the execution role `<prefix>-<env>-app-exec` |
+| `envs/<env>` | One `module "app_lambda"` call, the backend, the provider with `default_tags`, the committed `terraform.tfvars` |
+
+Order: `bootstrap` first (it creates the state bucket, the CI roles and the ECR repository), then one image push
+(App Deploy in dev, App Promote in prod), then `envs/<env>`: the function can only be created from an image that is
+already in the repository (ADR 0012 L3).
 
 ## Conventions
 
@@ -27,14 +37,14 @@ Order: `bootstrap` first (it creates the state bucket and the CI roles), then `e
 |---|---|
 | `make tf-check` | Offline policy rules (`tf/policy.sh`), README check, `fmt`, `init -backend=false`, `validate`, `terraform test` (own temporary data dir, so a real `init` in a checkout does not disturb it) |
 | `make docs` | Regenerate the `terraform-docs` tables in every README |
-| `make new-env ENV=<name> [FROM=dev] [CIDR=] [DRY_RUN=1]` | Clone an environment root (`scripts/tf/new-env.sh`): copies the tracked files of `envs/<from>/`, rewrites `env`, `vpc_cidr` and the backend key, writes the bootstrap account example, and prints the steps you run yourself. Never runs terraform, aws or gh |
+| `make new-env ENV=<name> [FROM=dev] [DRY_RUN=1]` | Clone an environment root (`scripts/tf/new-env.sh`): copies the tracked files of `envs/<from>/`, rewrites `env` and the backend key, writes the bootstrap account example, and prints the steps you run yourself. Never runs terraform, aws or gh |
 
 ## Environments
 
 Each environment is a thin root under `envs/<env>/` (name: 2 to 8 lowercase letters and digits). The roots are
 copies of `envs/dev/` and differ only in `terraform.tfvars`, the `key` line of `backend.tf`, `versions.tf` and
 `.terraform.lock.hcl`; `scripts/guard/env-parity.sh` (part of `make lint` and repo-guard) fails on any other
-difference, on a duplicate `vpc_cidr`, on a missing `bootstrap/accounts/<env>.tfvars.example`, and on an
+difference, on a missing `bootstrap/accounts/<env>.tfvars.example`, and on an
 environment missing from a workflow list (the dispatch choices, the `plan-<env>` caller job).
 
 `plan`, `apply` and `destroy` are never `make` targets: you run them at the checkpoint, or CI runs them with

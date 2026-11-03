@@ -48,19 +48,18 @@ locals {
     deploy = { sub = "${local.gh_sub_prefix}:environment:${var.env}", ref = "refs/heads/main", ref_test = "StringEquals", workflows = local.job_workflow_refs.deploy }
   }
 
-  # Name contract that Phase 3 must follow (ADR 0002).
+  # Name contract (ADR 0002, ADR 0012 L3, L4): envs/<env> and modules/app-lambda must use exactly these names,
+  # because the apply and deploy roles below are scoped by them.
   resource_names = {
-    ecs_cluster    = "${local.name}-cluster"
-    ecs_service    = "${local.name}-app"
-    task_family    = "${local.name}-app"
-    ecr_repository = "${local.name}-app"
-    log_group      = "/ecs/${local.name}-app"
-    alb            = "${local.name}-alb"
-    target_group   = "${local.name}-tg"
-    ecs_exec_role  = "${local.name}-ecs-exec"
-    ecs_task_role  = "${local.name}-ecs-task"
-    secret         = "${var.prefix}/${var.env}/app-api-key"
-    boundary       = "${local.name}-ecs-boundary"
+    function         = "${local.name}-app"
+    alias            = "live"
+    api              = "${local.name}-api"
+    app_exec_role    = "${local.name}-app-exec"
+    boundary         = "${local.name}-app-boundary"
+    ecr_repository   = "${local.name}-app"
+    lambda_log_group = "/aws/lambda/${local.name}-app"
+    api_log_group    = "/aws/apigateway/${local.name}-api"
+    secret           = "${var.prefix}/${var.env}/app-api-key"
   }
 
   role_names = {
@@ -70,21 +69,18 @@ locals {
   }
   guardrails_name = "${local.name}-gha-guardrails"
 
-  # Tags the apply role requires on EC2 resources (B7, B14).
-  tag_project = "ship-it-safely"
+  # Value of the Project tag (NFR-8): provider default_tags here and in envs/<env> use the same string.
+  tag_project = "ship-it-serverless"
 
   # ARN builders.
   iam_arn      = "arn:${local.partition}:iam::${local.account_id}"
-  svc_arn      = { for s in ["ecs", "ecr", "logs", "secretsmanager", "elasticloadbalancing", "ec2"] : s => "arn:${local.partition}:${s}:${local.region}:${local.account_id}" }
+  svc_arn      = { for s in ["lambda", "ecr", "logs", "secretsmanager", "cloudwatch"] : s => "arn:${local.partition}:${s}:${local.region}:${local.account_id}" }
   boundary_arn = "${local.iam_arn}:policy/${local.resource_names.boundary}"
 
-  ecs_role_arns = [
-    "${local.iam_arn}:role/${local.resource_names.ecs_exec_role}",
-    "${local.iam_arn}:role/${local.resource_names.ecs_task_role}",
-  ]
+  # The one role the apply role may create, change and pass (ADR 0012 L9): the function's execution role.
+  app_exec_role_arn = "${local.iam_arn}:role/${local.resource_names.app_exec_role}"
 
-  ecr_repo_pattern = "${local.svc_arn["ecr"]}:repository/${local.name}-*"
-  ecr_repo_app     = "${local.svc_arn["ecr"]}:repository/${local.resource_names.ecr_repository}"
+  ecr_repo_app = "${local.svc_arn["ecr"]}:repository/${local.resource_names.ecr_repository}"
   # Promotion source repository (ADR 0008 P9): read-only, the one repository, in the source account.
   ecr_repo_source = (
     local.is_promoted
@@ -92,8 +88,23 @@ locals {
     : null
   )
   secret_pattern = "${local.svc_arn["secretsmanager"]}:secret:${var.prefix}/${var.env}/*"
-  log_group_arns = [
-    "${local.svc_arn["logs"]}:log-group:/ecs/${local.name}-*",
-    "${local.svc_arn["logs"]}:log-group:/ecs/${local.name}-*:*",
+
+  # Lambda resource ARNs: the unqualified ARN covers the function, the ":*" form its versions and aliases.
+  function_arns_env = [
+    "${local.svc_arn["lambda"]}:function:${local.name}-*",
+    "${local.svc_arn["lambda"]}:function:${local.name}-*:*",
   ]
+  function_arn_app = "${local.svc_arn["lambda"]}:function:${local.resource_names.function}"
+
+  # API Gateway management ARNs have no account ID. HTTP API IDs are random, so /apis/* is every HTTP API of this
+  # region in this account; the apply role is the only writer and the account holds only this lab.
+  apigateway_arn = "arn:${local.partition}:apigateway:${local.region}::"
+
+  # The two log groups of an env (ADR 0012 L10), as group ARNs and with ":*" for their streams.
+  log_group_arns = flatten([
+    for p in ["/aws/lambda/${local.name}-*", "/aws/apigateway/${local.name}-*"] : [
+      "${local.svc_arn["logs"]}:log-group:${p}",
+      "${local.svc_arn["logs"]}:log-group:${p}:*",
+    ]
+  ])
 }

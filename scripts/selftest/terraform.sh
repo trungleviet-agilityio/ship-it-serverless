@@ -7,18 +7,18 @@ source "$(dirname "$0")/common.sh"
 
 # --- tf/plan-summary.sh
 good_plan='{"resource_changes":[
- {"address":"module.app_ecs.aws_vpc.this","change":{"actions":["create"]}},
- {"address":"module.app_ecs.aws_lb.this","change":{"actions":["delete","create"]}},
- {"address":"module.app_ecs.aws_ecr_repository.app","change":{"actions":["delete"]}},
- {"address":"module.app_ecs.aws_route.internet","change":{"actions":["no-op"]}}]}'
+ {"address":"module.app_lambda.aws_lambda_function.this","change":{"actions":["create"]}},
+ {"address":"module.app_lambda.aws_apigatewayv2_api.this","change":{"actions":["delete","create"]}},
+ {"address":"module.app_lambda.aws_cloudwatch_log_group.app","change":{"actions":["delete"]}},
+ {"address":"module.app_lambda.aws_lambda_alias.live","change":{"actions":["no-op"]}}]}'
 # The default heading follows ENV, so the runs below start from an unset ENV (the dev default).
 out="$(printf '%s' "$good_plan" | env -u ENV "$ROOT/scripts/tf/plan-summary.sh")"
 case "$out" in
-  *"Add 1, change 0, destroy 1, replace 1."*"| REPLACE | \`module.app_ecs.aws_lb.this\` |"*"| DELETE |"*) ok "plan summary counts and flags" ;;
+  *"Add 1, change 0, destroy 1, replace 1."*"| REPLACE | \`module.app_lambda.aws_apigatewayv2_api.this\` |"*"| DELETE |"*) ok "plan summary counts and flags" ;;
   *) die "selftest: unexpected plan summary: $out" ;;
 esac
 case "$out" in
-  *aws_route.internet*) die "selftest: no-op change must not be listed" ;;
+  *aws_lambda_alias.live*) die "selftest: no-op change must not be listed" ;;
 esac
 leak_plan="{\"resource_changes\":[{\"address\":\"aws_iam_role.x-${leak_id}\",\"change\":{\"actions\":[\"create\"]}}]}"
 # shellcheck disable=SC2016  # the inner script is meant to expand in the child shell
@@ -44,26 +44,26 @@ destroy_plan() {
   printf '{"resource_changes":[%s]}' "$rows"
 }
 destroy_check() { printf '%s' "$1" | "$ROOT/scripts/tf/destroy-check.sh"; }
-[ "$(destroy_check "$(destroy_plan '["delete"]' module.app_ecs.aws_vpc.this 'module.app_ecs.aws_lb.this[0]' module.app_ecs.module.x.aws_s3_bucket.y)")" = "3" ] \
-  || die "selftest: tf/destroy-check must count the deletes under module.app_ecs."
+[ "$(destroy_check "$(destroy_plan '["delete"]' module.app_lambda.aws_lambda_function.this 'module.app_lambda.aws_apigatewayv2_api.this[0]' module.app_lambda.module.x.aws_s3_bucket.y)")" = "3" ] \
+  || die "selftest: tf/destroy-check must count the deletes under module.app_lambda."
 [ "$(destroy_check '{"resource_changes":[]}')" = "0" ] || die "selftest: an empty resource_changes must count 0"
 [ "$(destroy_check '{}')" = "0" ] || die "selftest: a plan without resource_changes must count 0"
-mixed="$(printf '%s' "$(destroy_plan '["delete"]' module.app_ecs.aws_vpc.this)" | jq -c '.resource_changes += [
-  {"address":"module.app_ecs.aws_route.r","change":{"actions":["no-op"]}},
+mixed="$(printf '%s' "$(destroy_plan '["delete"]' module.app_lambda.aws_lambda_function.this)" | jq -c '.resource_changes += [
+  {"address":"module.app_lambda.aws_lambda_alias.r","change":{"actions":["no-op"]}},
   {"address":"data.aws_x.y","change":{"actions":["read"]}}]')"
 [ "$(destroy_check "$mixed")" = "1" ] || die "selftest: no-op and read entries must be ignored"
 ok "tf/destroy-check counts deletes and ignores no-op and read"
-expect_fail "destroy plan with a create" "module.app_ecs.aws_vpc.this (create)" destroy_check "$(destroy_plan '["create"]' module.app_ecs.aws_vpc.this)"
-expect_fail "destroy plan with an update" "module.app_ecs.aws_vpc.this (update)" destroy_check "$(destroy_plan '["update"]' module.app_ecs.aws_vpc.this)"
-expect_fail "destroy plan with a replace" "module.app_ecs.aws_vpc.this (delete+create)" destroy_check "$(destroy_plan '["delete","create"]' module.app_ecs.aws_vpc.this)"
-expect_fail "destroy plan with a forget" "module.app_ecs.aws_vpc.this (forget)" destroy_check "$(destroy_plan '["forget"]' module.app_ecs.aws_vpc.this)"
-expect_fail "destroy plan deleting outside the module" "outside module.app_ecs.: aws_s3_bucket.x" destroy_check "$(destroy_plan '["delete"]' aws_s3_bucket.x)"
-expect_fail "destroy plan deleting a lookalike module" "outside module.app_ecs.: module.app_ecs_other.aws_vpc.this" destroy_check "$(destroy_plan '["delete"]' module.app_ecs_other.aws_vpc.this)"
+expect_fail "destroy plan with a create" "module.app_lambda.aws_lambda_function.this (create)" destroy_check "$(destroy_plan '["create"]' module.app_lambda.aws_lambda_function.this)"
+expect_fail "destroy plan with an update" "module.app_lambda.aws_lambda_function.this (update)" destroy_check "$(destroy_plan '["update"]' module.app_lambda.aws_lambda_function.this)"
+expect_fail "destroy plan with a replace" "module.app_lambda.aws_lambda_function.this (delete+create)" destroy_check "$(destroy_plan '["delete","create"]' module.app_lambda.aws_lambda_function.this)"
+expect_fail "destroy plan with a forget" "module.app_lambda.aws_lambda_function.this (forget)" destroy_check "$(destroy_plan '["forget"]' module.app_lambda.aws_lambda_function.this)"
+expect_fail "destroy plan deleting outside the module" "outside module.app_lambda.: aws_s3_bucket.x" destroy_check "$(destroy_plan '["delete"]' aws_s3_bucket.x)"
+expect_fail "destroy plan deleting a lookalike module" "outside module.app_lambda.: module.app_lambda_other.aws_lambda_function.this" destroy_check "$(destroy_plan '["delete"]' module.app_lambda_other.aws_lambda_function.this)"
 
 # Actions run code on apply: a plan that invokes any is refused, even when every resource change is a delete.
-with_actions="$(destroy_plan '["delete"]' module.app_ecs.aws_vpc.this | jq -c '.action_invocations = [{"address":"action.x.y"}]')"
+with_actions="$(destroy_plan '["delete"]' module.app_lambda.aws_lambda_function.this | jq -c '.action_invocations = [{"address":"action.x.y"}]')"
 expect_fail "destroy plan with an action invocation" "invokes 1 action" destroy_check "$with_actions"
-[ "$(destroy_check "$(destroy_plan '["delete"]' module.app_ecs.aws_vpc.this | jq -c '.action_invocations = []')")" = "1" ] \
+[ "$(destroy_check "$(destroy_plan '["delete"]' module.app_lambda.aws_lambda_function.this | jq -c '.action_invocations = []')")" = "1" ] \
   || die "selftest: an empty action_invocations list must pass"
 
 # --- tf/init.sh (stub terraform: arguments are logged, nothing runs). ENV is the single key.
@@ -144,33 +144,28 @@ expect_fail "resolved sources without a lock file" "no .terraform.lock.hcl" reso
 ok "resolved sources: local modules and hashicorp providers only"
 
 # --- tf/destroy-report.sh: the heading states the real outcome (ADR 0007 S12)
-# report <deletes> <apply outcome> [deregistered]: without the third argument DEREGISTERED stays unset.
-report() {
-  local dereg=()
-  if [ $# -ge 3 ]; then dereg=("DEREGISTERED=$3"); fi
-  env -u DEREGISTERED ENV=dev DELETES="$1" APPLY_OUTCOME="$2" ROLE=sis-dev-gha-apply ${dereg[@]+"${dereg[@]}"} "$ROOT/scripts/tf/destroy-report.sh"
-}
+# report <deletes> <apply outcome>
+report() { env ENV=dev DELETES="$1" APPLY_OUTCOME="$2" ROLE=sis-dev-gha-apply "$ROOT/scripts/tf/destroy-report.sh"; }
 # The whole report is captured first: piping into `head` closes the pipe early and the report dies of SIGPIPE.
 report_head() {
   local out
   out="$(report "$@")"
   printf '%s\n' "${out%%$'\n'*}"
 }
-[ "$(report_head 5 success 4)" = "### Destroyed (dev)" ] || die "selftest: a successful destroy must be headed Destroyed"
-[ "$(report_head 5 failure 0)" = "### Destroy failed (dev)" ] || die "selftest: a failed apply must be headed Destroy failed"
-[ "$(report_head 5 skipped 0)" = "### Destroy failed (dev)" ] || die "selftest: an apply that did not succeed must not read as Destroyed"
-[ "$(report_head 0 skipped 0)" = "### Nothing to destroy (dev)" ] || die "selftest: an empty plan must be headed Nothing to destroy"
-[ "$(report_head "" skipped 0)" = "### Destroy did not finish (dev)" ] || die "selftest: a missing plan check must be headed Destroy did not finish"
+[ "$(report_head 5 success)" = "### Destroyed (dev)" ] || die "selftest: a successful destroy must be headed Destroyed"
+[ "$(report_head 5 failure)" = "### Destroy failed (dev)" ] || die "selftest: a failed apply must be headed Destroy failed"
+[ "$(report_head 5 skipped)" = "### Destroy failed (dev)" ] || die "selftest: an apply that did not succeed must not read as Destroyed"
+[ "$(report_head 0 skipped)" = "### Nothing to destroy (dev)" ] || die "selftest: an empty plan must be headed Nothing to destroy"
+[ "$(report_head "" skipped)" = "### Destroy did not finish (dev)" ] || die "selftest: a missing plan check must be headed Destroy did not finish"
 # shellcheck disable=SC2016  # the backticks are Markdown, not a command
-case "$(report 5 success 4)" in
-  *"Resources: 5 deleted"*"deregistered: 4"*'Role: `sis-dev-gha-apply`'*) ;;
+case "$(report 5 success)" in
+  *"Resources: 5 deleted"*'Role: `sis-dev-gha-apply`'*) ;;
   *) die "selftest: unexpected destroy report body" ;;
 esac
-case "$(report 5 failure)" in
-  *"deregistered: not known (the cleanup did not start)"*) ;;
-  *) die "selftest: an unset DEREGISTERED must read as not known" ;;
+case "$(report 5 success)" in
+  *"deregistered"* | *"Task definition"*) die "selftest: the destroy report still mentions task definition revisions" ;;
 esac
-case "$(report 5 failure 0)" in
+case "$(report 5 failure)" in
   *"5 planned; the apply did not succeed (failure)"*) ;;
   *) die "selftest: a failed apply must say so" ;;
 esac

@@ -40,7 +40,8 @@ image="${acct}.dkr.ecr.ap-southeast-1.amazonaws.com/sis-dev-app@sha256:${digest}
 
 # --- Stub aws, docker, gh, crane and terraform: file-driven replies, so the scripts that call them run offline.
 # The stub answers a call from files in $sd: <key>.out (stdout), <key>.err (stderr) and <key>.rc (exit code, default
-# 0). A suffix .N applies to the N-th call only (0-based). The key is aws-<service>-<operation>, gh-<group>-<command>
+# 0), and for aws-lambda-invoke <key>.payload (written to the outfile). A suffix .N applies to the N-th call only
+# (0-based). The key is aws-<service>-<operation>, gh-<group>-<command>
 # (gh-run-list, gh-run-view), docker-<command>, or crane-<command> (crane-digest-src for a repository named
 # sis-dev-app, crane-digest-tgt for any other, crane-copy, crane-auth). docker and crane also record the
 # DOCKER_CONFIG they ran with in docker-config, and crane fails when it is not an existing directory, as it would
@@ -63,6 +64,8 @@ case "$key" in docker-login | crane-auth) cat >/dev/null ;; esac
 [ "$key" = docker-save ] && printf 'image tar' >"$3"
 pick() { if [ -f "$dir/$key.$1.$n" ]; then echo "$dir/$key.$1.$n"; elif [ -f "$dir/$key.$1" ]; then echo "$dir/$key.$1"; fi; }
 f="$(pick out)"; [ -z "$f" ] || cat "$f"
+# aws lambda invoke writes the function response to its last argument (the outfile): <key>.payload[.N].
+if [ "$key" = aws-lambda-invoke ]; then f="$(pick payload)"; [ -z "$f" ] || cat "$f" >"${*: -1}"; fi
 f="$(pick err)"; [ -z "$f" ] || cat "$f" >&2
 f="$(pick rc)"; [ -z "$f" ] || exit "$(cat "$f")"
 exit 0
@@ -77,7 +80,7 @@ echo "terraform $*" >>"${STUB_DIR:?}/calls"
 EOF
 chmod +x "$tmp/stub/terraform"
 sd=""
-# stub_reset: a fresh reply directory. stub <key> <out|err|rc> <content> [call number]: set one reply.
+# stub_reset: a fresh reply directory. stub <key> <out|err|rc|payload> <content> [call number]: set one reply.
 stub_reset() { sd="$(mktemp -d "$tmp/stub-replies.XXXXXX")"; }
 stub() { printf '%s' "$3" >"$sd/$1.$2${4:+.$4}"; }
 # stubbed <command...>: run with the stubs first on PATH.
