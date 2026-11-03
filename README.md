@@ -1,379 +1,342 @@
-# ship-it-safely
+# ship-it-serverless
 
 > Vibe coding an app is easy; shipping it safely is hard.
 
-[![Repo Guard](https://github.com/trungleviet-agilityio/ship-it-safely/actions/workflows/repo-guard.yml/badge.svg?branch=main)](https://github.com/trungleviet-agilityio/ship-it-safely/actions/workflows/repo-guard.yml)
-[![Terraform](https://github.com/trungleviet-agilityio/ship-it-safely/actions/workflows/terraform-iac.yml/badge.svg?branch=main)](https://github.com/trungleviet-agilityio/ship-it-safely/actions/workflows/terraform-iac.yml)
-[![App Deploy](https://github.com/trungleviet-agilityio/ship-it-safely/actions/workflows/app-deploy.yml/badge.svg?branch=main)](https://github.com/trungleviet-agilityio/ship-it-safely/actions/workflows/app-deploy.yml)
+A small web app shipped to **AWS Lambda as a web function**. The unchanged HTTP server runs inside a container
+image behind the AWS Lambda Web Adapter, with an API Gateway HTTP API in front. It ships through GitHub
+Actions and Terraform with OIDC instead of access keys, separate plan, apply and deploy roles, Secrets Manager per
+environment, versions and an alias for releases, an alias-weighted canary, rollback in seconds, and promote by
+digest from dev to prod.
 
-A small containerized app shipped to AWS ECS Fargate through GitHub Actions + Terraform: OIDC instead of
-access keys, separate plan/apply/deploy roles, Secrets Manager per environment, supply-chain hardening.
+Created from the [`ship-it-safely`](https://github.com/trungleviet-agilityio/ship-it-safely) template (ECS
+Fargate). ADRs 0001 to 0011 are that lab's history; [ADR 0012](docs/adr/0012-lambda-web-function-architecture.md)
+moves the runtime to Lambda.
 
 - Requirements (goal, scope, `FR-*`, `NFR-*`): [`docs/requirements.md`](docs/requirements.md)
-- Locked decisions: [`docs/adr/`](docs/adr/)
-- Agent team: [`plugins/sis-team/`](plugins/sis-team/)
-- Diagrams: [overview](docs/diagrams/overview.drawio.png), [infra pipeline](docs/diagrams/ci-cd.drawio.png),
-  [app pipeline](docs/diagrams/ci-cd-app-pipeline.drawio.png), [app-ecs runtime](docs/diagrams/app-ecs.drawio.png),
-  [bootstrap](docs/diagrams/bootstrap.drawio.png) (all in [`docs/diagrams/`](docs/diagrams/))
+- Decisions: [`docs/adr/`](docs/adr/), start with [ADR 0012](docs/adr/0012-lambda-web-function-architecture.md)
+- **Every trade-off, for study:** [`docs/tradeoffs.md`](docs/tradeoffs.md)
+- Standards per domain: [`docs/reference/standards/`](docs/reference/standards/)
 
-![Overview](docs/diagrams/overview.drawio.png)
+## Architecture
 
-## Agent team (Claude Code plugin `sis-team`)
+```
+            ┌──────────── GitHub Actions ─────────────┐
+            │ app-ci (PR, no AWS)                      │
+            │ app-deploy (main → dev)   app-promote    │──OIDC──► STS (per account)
+            │ terraform-iac / -destroy                 │          plan | apply | deploy roles
+            └──────────────────────────────────────────┘
 
-| Agent | Phase | Model | Access | Job |
-|---|---|---|---|---|
-| `solution-architect` | Plan | opus | Read-only + web | ADR per phase: IAM, OIDC trust, module design, from official docs |
-| `backend-dev` | Build | sonnet | Full, own worktree | `app/**`: app, Dockerfile, compose, tests (TDD) |
-| `devops-engineer` | Build | sonnet | Full, own worktree, no apply | `infra/**`, `.github/**`: Terraform, workflows, linters |
-| `e2e` | Verify | sonnet | Bash, no edits | compose up + endpoint checks, offline `terraform test`, compare with `main` |
-| `reviewer` | Verify | sonnet | Read-only | Bugs, logic, coverage of FR/NFR |
-| `security-reviewer` | Verify | opus | Read-only | IAM, trust `sub`, `iam:PassRole`, pinning, secret leaks |
-| `code-simplifier` | Verify | sonnet | Read-only | Redundant Terraform/YAML/app code |
+each account (dev, prod)
+  bootstrap (admin, once):  S3 state · OIDC provider · roles · budget · ECR sls-<env>-app · trail + alert topic
+  env stack (terraform-iac):
+     client ─► HTTP API sls-<env>-api ($default stage: throttling 5 rps / burst 10, JSON access log)
+                 └─► Lambda alias "live" ─► version N ─► image sls-<env>-app@sha256:<digest>
+                                               └─► Lambda Web Adapter ─► app :8080 (ready when /health is 200)
+                 execution role sls-<env>-app-exec ─► Secrets Manager sls/<env>/app-api-key (read at cold start)
+                 logs 7 days · alarms (errors, throttles, 5xx) ─► SNS sls-<env>-security-alerts
+```
 
-Docs (`README.md`, `docs/**`) are written by the session that runs `/sis-team:run`, after the merge and before
-verify; `reviewer` checks them for drift (ADR 0001, D14).
-
-Commands: `/sis-team:plan <phase>`, `/sis-team:run <phase>`, `/sis-team:review [PR]`, `/sis-team:team` (this
-table, generated from the agent files) and `/sis-team:diagram <topic>` (AWS architecture diagrams in
-[`docs/diagrams/`](docs/diagrams/)).
-
-Guardrails (ADR 0001, D8): no admin AWS credentials in the Claude Code shell, deny rules in
-`.claude/settings.json`, and a `PreToolUse` guard hook in the plugin. `terraform apply`/`destroy` and secret
-values are always handled by a human at the checkpoint.
+| Piece | Where | Why (details in [`docs/tradeoffs.md`](docs/tradeoffs.md)) |
+|---|---|---|
+| Image + Lambda Web Adapter v1.1.0 (pinned by digest) | [`app/Dockerfile`](app/Dockerfile) | Same image locally, in CI and on Lambda; no handler rewrite |
+| API Gateway HTTP API | [`modules/app-lambda/api.tf`](infra/terraform/modules/app-lambda/api.tf) | Throttling is a cost ceiling in any account; access logs |
+| Alias `live`, published versions | [`modules/app-lambda/lambda.tf`](infra/terraform/modules/app-lambda/lambda.tf) | A version pins one digest; release and rollback are one alias move |
+| ECR in bootstrap | [`bootstrap/ecr.tf`](infra/terraform/bootstrap/ecr.tf) | A function needs an existing private image; images outlive env teardown |
+| Secret read with stdlib SigV4 | [`app/src/aws_sigv4.py`](app/src/aws_sigv4.py) | Keeps the app stdlib-only; the build stays credential-free |
+| Deploy role without `iam:PassRole` | [`bootstrap/iam_deploy.tf`](infra/terraform/bootstrap/iam_deploy.tf) | A deploy can change code, never the execution role |
 
 ## Setup
 
-Prerequisites (macOS): Docker, the GitHub CLI and [mise](https://mise.jdx.dev). Every other CLI the repo
-uses (Terraform 1.17.0, terraform-docs, tflint, actionlint, hadolint, shellcheck, gitleaks, trivy, pre-commit,
-uv) is pinned in [`mise.toml`](mise.toml). Install them once from the repo root:
-
-```bash
-brew install mise
-```
+Prerequisites (macOS): Docker, the GitHub CLI and [mise](https://mise.jdx.dev). Every other CLI is pinned in
+[`mise.toml`](mise.toml). From the repo root:
 
 ```bash
 mise install
 ```
 
-For `/sis-team:diagram` exports, also `brew install --cask drawio` (draw.io Desktop and its CLI; mise has no
-draw.io).
-
-Add `eval "$(mise activate zsh)"` to `~/.zshrc` so the pinned versions come first on `PATH` inside the repo
-(`which terraform` should point into `~/.local/share/mise`). Another version manager that also ships
-`terraform` (for example asdf) must not come before mise on `PATH`.
-
-Create the hash-locked CI venv once (PyYAML for the workflow trigger check, ADR 0007 S34; `make check`
-needs it):
-
 ```bash
 make venv
 ```
 
-Install the git hooks once:
-
 ```bash
 pre-commit install
-```
-
-Register the repo-local marketplace and install the plugin once (from the repo root):
-
-```bash
-claude plugin marketplace add ./
-```
-
-```bash
-claude plugin install sis-team@sis-lab --scope project
 ```
 
 Day to day, run everything through `make` (`make help` lists the targets):
 
 | Target | Does |
 |---|---|
-| `make venv` | Hash-locked CI venv in `.venv-ci` (PyYAML for the workflow trigger check); created once, then reused |
-| `make up` / `make down` | Run or stop the app on http://localhost:8080 (creates `app/.env` from the example) |
-| `make test` | App unit tests |
-| `make lint` | pre-commit hooks (including gitleaks, zizmor and the account-ID guard), hadolint, shellcheck, actionlint, CI helper self-tests |
-| `make tf-check` | Offline Terraform policy rules (with their self-test), README check, `fmt`, `validate`, `terraform test` (no AWS; uses a temporary data dir, so a real S3 `init` in the checkout does not break it) |
-| `make docs` | Regenerate the `terraform-docs` tables in Terraform READMEs |
-| `make verify` (or `make image` / `make smoke` / `make scan`) | Build the app image the way CI does, run it like Fargate (read-only, UID 10001, root-owned `/tmp`), scan it with Trivy (fixable HIGH or CRITICAL fails). The same recipe as `app-ci` (`scripts/image/verify.sh`). Not part of `make check` |
-| `make check` | All of the above checks; what a PR must pass |
+| `make up` / `make down` | Run or stop the app on http://localhost:8080 (the Web Adapter is inert outside Lambda) |
+| `make test` | App unit tests, including SigV4 against AWS's published example |
+| `make lint` | pre-commit (gitleaks, zizmor, ruff, mypy, terraform hooks, account-ID guard), hadolint, shellcheck, actionlint, guards and CI helper self-tests |
+| `make tf-check` | Offline Terraform policy rules, README check, `fmt`, `validate`, `terraform test` with mock providers |
+| `make verify` | Build the image the way CI does, smoke test it read-only as UID 10001, scan it with Trivy |
+| `make check` | Everything a PR must pass |
 
-There is no `apply` or `destroy` target (ADR 0001, D15): `envs/dev` is applied by `terraform-iac` and destroyed
-by `terraform-destroy`, both after your approval; only the bootstrap stack is applied and destroyed by hand.
-
-Then in Claude Code: `/sis-team:run 0` to build Phase 0 (local app).
-
-## Infrastructure
-
-Terraform lives in [`infra/terraform/`](infra/terraform/), and each root and module documents itself in its own
-`README.md`: start with [`infra/terraform/README.md`](infra/terraform/README.md). The one-time bootstrap of an
-account (state bucket, OIDC provider, roles, budget) is in
-[`infra/terraform/bootstrap/README.md`](infra/terraform/bootstrap/README.md).
-
-`envs/dev` uses [`modules/app-ecs`](infra/terraform/modules/app-ecs/README.md): a VPC with two public subnets
-(no NAT), an internet-facing ALB on HTTP 80, one Fargate task (0.25 vCPU, 0.5 GB, `ROLLING` with circuit
-breaker rollback), ECR, a 7-day log group and the secret shell `sis/dev/app-api-key`. Terraform owns the shape
-of the task definition; `app-deploy` only swaps in the app image by digest (ADR 0005 F2). The app runs as UID
-10001 with a read-only root and must never write to disk.
-
-### Adding an environment
-
-Each environment is a thin root `envs/<env>/` over the same module (ADR 0008 P1). Copies may differ only in
-`terraform.tfvars`, the `key` line of `backend.tf`, `versions.tf` and `.terraform.lock.hcl` (so a provider
-upgrade reaches dev before prod); `scripts/guard/env-parity.sh` fails any PR with another difference or a
-half-wired env. To clone one:
-
-```bash
-make new-env ENV=qa DRY_RUN=1
-```
-
-Without `DRY_RUN` it writes `envs/qa/` (tracked files of `envs/dev/` only, with `env`, the next free
-`vpc_cidr` and the backend key rewritten), `bootstrap/accounts/qa.tfvars.example` and the gitignored
-`accounts/qa.tfvars`, then prints the steps you run: the account, the bootstrap, the GitHub environment and
-secrets, and the workflow lines to add. It never calls `terraform`, `aws` or `gh`, and never writes an account
-ID. Names match `^[a-z][a-z0-9]{1,7}$`.
-
-### Using this repo as a template for another product
-
-The pipeline fits any HTTP service that ships as one container image to ECS Fargate behind an ALB, in any
-language. Every AWS name is `<prefix>-<env>-<thing>`, and the prefix lives in one file,
-[`project.env`](project.env) (ADR 0011). In a fresh fork, before any bootstrap:
-
-```bash
-make set-prefix PREFIX=acme
-```
-
-It rewrites `project.env` and the few copies that cannot read it (Terraform defaults and tfvars, the state bucket
-host in the harden-runner allowlists, the compose image); `make lint` fails if one drifts later. Then:
-
-1. Replace `app/` and the lint and test steps of `app-ci.yml`. Keep the app contract: one container port and a
-   health path (module inputs `container_port`, `health_check_path`), a `/version` endpoint that reports the
-   commit SHA and image digest, no writes to disk, secrets read from the environment.
-2. More secrets or a database: extend `modules/app-ecs` (the secret shell) or add a module next to it.
-3. Bootstrap each account and set the GitHub environments and secrets as in [Setup](#setup).
-
-Changing the prefix on a live project names new resources; nothing in AWS is renamed.
-
-## How the trust works
-
-GitHub Actions never holds AWS keys. Each job asks GitHub for an OIDC token and exchanges it with AWS STS for
-one role. The role's trust policy decides which tokens it accepts (ADR 0002 B13, ADR 0004 E1 and E2):
-
-| Condition | Value | What it blocks |
-|---|---|---|
-| `aud` | `sts.amazonaws.com` | Tokens minted for another audience |
-| `sub` (immutable format) | `repo:OWNER@OWNER_ID/REPO@REPO_ID:pull_request` (plan) or `...:environment:dev` (apply, deploy) | Other repos, a renamed or re-created repo with the same name, the wrong event or environment |
-| `repository_id`, `repository_owner_id` | numeric IDs | The same, as a second check |
-| `ref` on the plan role | `StringLike refs/pull/*/merge` | `pull_request_target` runs and dispatched runs, which carry `refs/heads/main` |
-| `ref` on apply and deploy | `refs/heads/main` | A branch run that adds `environment: dev` to a job |
-| `aws:RequestedRegion` on every role | `ap-southeast-1` | An assumption through another region's STS or the global endpoint, where the security alert does not look (ADR 0007 verify M1) |
-| `job_workflow_ref` on apply and deploy | `OWNER/REPO/.github/workflows/terraform-iac.yml@refs/heads/main` and `.../terraform-destroy.yml@refs/heads/main` (apply); `.../app-deploy.yml@refs/heads/main` (dev deploy) or `.../app-promote.yml@refs/heads/main` (prod deploy) | Any other workflow file, even one that copies a trusted `name:`; a renamed file needs a bootstrap re-apply (ADR 0007 S2) |
-
-Gates outside the trust policy:
-
-- **Environment `dev`:** your approval, and deployments only from `main`.
-- **Guardrails** on every GitHub role: no secret values, no SSM parameters, no role chaining, no writes to the
-  GitHub roles, guardrails, boundary or OIDC provider, no access to the bootstrap state.
-- **ECS role boundary:** any role the apply role creates is capped by `sis-dev-ecs-boundary`.
-- **Exact `iam:PassRole`:** only the two ECS roles, only to `ecs-tasks.amazonaws.com`.
-- **`repo-guard`:** every workflow may only use `pull_request`, `push` or `workflow_dispatch`, and only
-  `reusable-*.yml` files may use `workflow_call` (and nothing else); checked with a real YAML parser.
-- **Security alert:** a CloudTrail trail plus an EventBridge rule email you (SNS) about every refused
-  `AssumeRoleWithWebIdentity` in ap-southeast-1 and any assumption with a `sub` other than the two trusted ones
-  (ADR 0007 S8). The region pin means a success can only happen there; refused probes in other regions are not
-  alerted (accepted: they grant nothing). The email is a few plain lines (time, error code, role, `sub`,
-  session, source IP), not the raw event. Diagram:
-  [bootstrap security alert](docs/diagrams/bootstrap-security-alert.drawio.png).
+There is no `apply` or `destroy` target (ADR 0001 D15).
 
 ## Pipelines (`.github/workflows/`)
 
-Workflow names follow [`docs/reference/standards/ci-cd.md`](docs/reference/standards/ci-cd.md#naming): the Actions
-tab shows the Title Case name; the file name is the ID the role trusts pin.
-
 | Workflow | Trigger | Does |
 |---|---|---|
-| **Terraform** [`terraform-iac.yml`](.github/workflows/terraform-iac.yml) | PR to `main` touching `infra/**` (and its scripts) | `checks` (no AWS: policy rules, fmt, validate, `terraform test`, tflint), then one `plan (<env>)` caller per environment of **Terraform Plan (reusable)** [`reusable-terraform-plan.yml`](.github/workflows/reusable-terraform-plan.yml) (secrets passed by name, never `inherit`): `terraform plan` with the plan role (no `environment:`), `role guardrails` (plan-role negative tests), and one sticky PR comment with counts and changed addresses (no account ID). PR plans queue instead of cancelling, so a state lock is never left behind |
-| | push to `main` touching `envs/dev`, `modules/` or the workflow file (always dev), or `workflow_dispatch` with input `env` | `apply` in that environment (your approval required) with the apply role: plan, then apply that saved plan |
-| **Terraform Destroy** [`terraform-destroy.yml`](.github/workflows/terraform-destroy.yml) | `workflow_dispatch` only: input `env` (`dev` or `prod`) and `confirm`, which must be typed as `destroy-<env>` | Job `confirm` (no AWS, no secrets) rejects a wrong phrase before any approval is requested. Job `destroy` (environment `dev`, your approval, apply role): `plan -destroy`, a guard that refuses any action other than delete, apply of that same saved plan, then deregisters the task definition revisions `app-deploy` registered. Green with "nothing to destroy" when the stack is already gone. Shares one concurrency group with the `terraform-iac` apply |
-| **App CI** [`app-ci.yml`](.github/workflows/app-ci.yml) | PR to `main` touching `app/**` (and its scripts) | No AWS, no secrets: hadolint, build once (unit tests run inside the build), Fargate-like smoke test, Trivy gate. Never pushes |
-| **App Deploy** [`app-deploy.yml`](.github/workflows/app-deploy.yml) | push to `main` touching `app/**` or the scripts it runs, or `workflow_dispatch` | Two jobs. `build-scan` has **no OIDC, no environment and no secrets**: build, smoke, Trivy, then the image tar as a one-day artifact with its sha256. `deploy` (environment `dev`, your approval) verifies the sha256 before `docker load`, checks the stack is up and the secret has a value, then pushes once to ECR with the git SHA tag, registers a task definition revision that references the image **digest** (only `image` changes; the hardened shape is validated), updates the service and waits until the rollout is `COMPLETED` (a circuit-breaker rollback fails the run). The file path is in the deploy role trust: renaming the file needs a bootstrap re-apply |
-| **App Promote** [`app-promote.yml`](.github/workflows/app-promote.yml) | `workflow_dispatch` on `main`: input `env` (`prod`) and a commit `sha` | Two jobs. `resolve` (no AWS) requires the SHA to be an ancestor of `main` with a green `deploy (dev)` job. `promote` (environment `prod`, your approval, prod deploy role, containers off) copies the dev image to the prod ECR **by digest** with crane, or reuses the digest prod already holds for that SHA (rollback), then renders, registers, updates and waits like `app-deploy`. The file path is in the prod deploy role trust (ADR 0008 P7, P9, P10) |
-| **Repo Guard** [`repo-guard.yml`](.github/workflows/repo-guard.yml) | every PR to `main` and push to `main`, no path filter | No AWS, no secrets: zizmor, the account-ID guard, gitleaks, the workflow trigger allowlist, the harden-runner policy, the environment parity guard and the CI helper self-tests. It must never be listed in the bootstrap `workflow_files` |
-| **OIDC Smoke Test** [`oidc-smoke-test.yml`](.github/workflows/oidc-smoke-test.yml) | PR to `main` that changes the workflow file or its scripts; `workflow_dispatch` | Diagnostic and negative tests. On a PR: the token is refused by the apply and deploy roles (N8), a 3601 s session on the plan role is refused and a 900 s one shows its expiry (N9), then the plan role is assumed. On dispatch: every dev and prod role refuses the non-PR token (N1), and a job in environment `dev` is refused by every prod role (N10). Each refusal also sends a security alert email, by design |
+| **App CI** `app-ci.yml` | PR touching `app/**` | No AWS: hadolint, build (tests run inside), smoke, Trivy |
+| **App Deploy** `app-deploy.yml` | push to `main` touching `app/**`; dispatch | `build-scan` (no AWS) then `deploy (dev)` with approval: preflight, push by SHA tag, update code by **digest**, set `IMAGE_DIGEST`, publish a version, **smoke-invoke that version**, move `live` (all at once, or canary), check `/version` through the API, prune old versions. Dispatch inputs: `mode` (`deploy` or `rollback`), `strategy` (`all-at-once` or `canary`), `canary_percent`, `bake_minutes`, `sha` (rollback) |
+| **App Promote** `app-promote.yml` | dispatch on `main` with a green `sha` | `resolve` (no AWS; the SHA must be on `main` with a dev deploy whose step "Verify live through the API" passed, so an image that never ran on Lambda cannot be promoted), then `promote` in `prod` with approval: crane copy by digest from dev ECR, then the same release steps. Rollback = promote an earlier green SHA; when prod already has a version with that digest, only the alias moves |
+| **Terraform** `terraform-iac.yml` | PR touching `infra/**`; push to `main`; dispatch | Plan with the read-only role and a PR comment; apply with approval |
+| **Terraform Destroy** `terraform-destroy.yml` | dispatch, typed confirmation | Delete-only plan, then apply that plan |
+| **Repo Guard**, **OIDC Smoke Test** | every PR / trust changes | Workflow policy, secrets scan, parity guard, negative trust tests |
 
-Every job with steps starts with `step-security/harden-runner` (a job that only calls a reusable workflow is
-checked through the callee's jobs). The seven jobs that assume an AWS role run it in `block` mode
-with telemetry off and an exact `allowed-endpoints` list (hosts that hold the account ID are built from
-`secrets.AWS_ACCOUNT_ID`, never written out), and all of them except `deploy` (which needs Docker) also
-disable sudo and containers, so code in the job cannot switch the firewall off; every other job runs `audit`. The repo-guard check
-`scripts/guard/harden-runner.sh` fails a PR that breaks this shape. If a block-mode job fails on a blocked host,
-the job log names it: add it to that job's list in a short PR (the guard check refuses `audit` on these jobs, so
-there is no audit fallback on `main`). Terraform runs with
-`CHECKPOINT_DISABLE=1`. Every action is pinned to a commit SHA, and
-tools (Terraform, tflint, Trivy, hadolint) are checksum-verified binaries. Fork and Dependabot PRs get no OIDC
-token, so the jobs that assume a role skip them.
+### How a release works
 
-### Dependabot
+1. `UpdateFunctionCode --image-uri <repo>@sha256:<digest>`, then `IMAGE_DIGEST` is set so `/version` can prove
+   the digest.
+2. `PublishVersion` with the description `sha=<sha> digest=<digest>`. A version is immutable: it pins that digest.
+3. The pipeline invokes **the new version directly** (not the alias) with an API Gateway event for `/health` and
+   `/version`. A broken build stops here and never receives traffic: the Web Adapter only reports ready when
+   `/health` answers 200.
+4. `all-at-once`: `live` points at the new version. `canary`: `live` keeps the old version and sends
+   `canary_percent` to the new one for `bake_minutes`; synthetic probes and the new version's `Errors` metric decide
+   to promote it to 100 percent or remove the weight.
+5. `/version` through the API must show the SHA and digest.
 
-[`.github/dependabot.yml`](.github/dependabot.yml) opens one grouped PR a month per ecosystem (GitHub Actions,
-the Docker base image, Terraform providers, pre-commit hooks), each after a 7-day cooldown; security updates come
-at once. Three rules when you handle them:
-
-- **Terraform PRs get no plan** (Dependabot has no secrets). Before merging one, re-open it from your own
-  branch: `gh pr checkout <N>`, `git switch -c deps/terraform-<date>`, `git push -u origin HEAD`, open a PR,
-  read its plan comment, merge it, and close the Dependabot PR.
-- **The Python base image only gets digest and patch updates** (`ignore` on minor and major for
-  `docker/library/python`). Moving to a new Python is a planned change across `mise.toml`, `pyproject.toml` and
-  `app/Dockerfile`.
-- **Merging an actions PR touches every workflow**, so the `terraform-iac` apply and `app-deploy` start. If the
-  stack is down, **reject** the pending apply: approving it re-creates the stack.
-
-Not covered by Dependabot, so check them monthly by hand: the tool versions in `mise.toml` with
-`scripts/ci/tools.sha256`, and `scripts/ci/requirements.txt`.
-
-### Repo configuration the pipelines read
+## Repo configuration the pipelines read
 
 | Where | Name | Kind |
 |---|---|---|
-| Repo | `AWS_PLAN_ROLE_ARN_<ENV>`, `AWS_ACCOUNT_ID_<ENV>` | secrets for the PR plan, which has no environment (they hold the account ID; variables would print unmasked in public logs). `terraform-iac` maps them to the reusable plan by name |
-| Repo | `AWS_REGION` | variable |
-| Repo and environment | `ALB_INGRESS_CIDRS_<ENV>` (repo, for the PR plan, optional) and `ALB_INGRESS_CIDRS` (environment, **required** for apply), same value | secret: a JSON list such as `["<your IP>/32"]`, or `["0.0.0.0/0"]` to be open on purpose. The apply refuses an empty environment value, so a forgotten secret can never open the ALB (ADR 0008 round 1); the PR plan and the teardown treat unset as `0.0.0.0/0`. The plan masks each CIDR and the rules hold no CIDR in their names (ADR 0007 S10) |
-| Environment `<env>` | `AWS_ACCOUNT_ID`, `AWS_APPLY_ROLE_ARN`, `AWS_DEPLOY_ROLE_ARN`, `ALB_INGRESS_CIDRS` | secrets with the same names in every environment, only readable by jobs you approved, so one job definition serves every env (ADR 0008 P5) |
-| Environment `dev` | required reviewer (you), deployment branches: `main` only | protection rules |
-| Repo | ruleset on the default branch: PR required, no force push, no deletion, status check `guard` (Repo Guard, source GitHub Actions) required | ruleset |
-| Repo | [`.github/CODEOWNERS`](.github/CODEOWNERS) (`* @trungleviet-agilityio`); "require review from code owners" stays off while there is one maintainer | file |
+| Repo | `AWS_PLAN_ROLE_ARN_<ENV>`, `AWS_ACCOUNT_ID_<ENV>` | secrets for the PR plan (no environment) |
+| Repo | `AWS_REGION` = `ap-southeast-1` | variable |
+| Environment `<env>` | `AWS_ACCOUNT_ID`, `AWS_APPLY_ROLE_ARN`, `AWS_DEPLOY_ROLE_ARN` | secrets, same names in every environment |
+| Environment `dev`, `prod` | required reviewer (you), deployment branches `main` only | protection rules |
+| Repo | ruleset on `main`: PR required, no force push, status check `guard` required | ruleset |
 
-The state bucket name is derived from the account ID and region, so it is not stored anywhere (ADR 0004 E22).
+## Checkpoint: the commands you run
 
-## Session flow
+Claude never runs `terraform apply`, `destroy`, `import`, `state`, or reads or writes secret values (NFR-9).
+Run these from the repo root, in order. Replace `<...>` placeholders; never commit real values.
 
-Re-create the dev stack:
+### 1. Bootstrap the dev account (admin, once)
 
-1. **Run workflow** on `terraform-iac` (branch `main`), then approve it in `dev`. About 4 minutes.
-2. Set the secret value, you and never Claude, in your own terminal, in one line so the key never lands in
-   history or another shell:
+Fill `infra/terraform/bootstrap/accounts/dev.tfvars` from `dev.tfvars.example` (gitignored). Then:
 
 ```bash
-APP_API_KEY_VALUE="$(openssl rand -hex 24)" && AWS_PROFILE=sis-dev-admin aws secretsmanager put-secret-value --region ap-southeast-1 --secret-id sis/dev/app-api-key --secret-string "$APP_API_KEY_VALUE" --query VersionId --output text && unset APP_API_KEY_VALUE
+aws sso login --profile sls-dev-admin
 ```
 
-3. **Run workflow** on `app-deploy` (branch `main`), then approve the `deploy` job. If you skipped step 2, the
-   deploy stops at the preflight with a message saying so, instead of a failed rollout.
+```bash
+AWS_PROFILE=sls-dev-admin aws sts get-caller-identity --query Account --output text
+```
 
-End of the session:
+Expect: the dev account ID.
 
-4. **Run workflow** on `terraform-destroy`: `env` = `dev`, `confirm` = `destroy-dev`, then approve.
+The first apply runs on local state: create `infra/terraform/bootstrap/backend_override.tf` containing
+`terraform { backend "local" {} }`, then:
 
-Wait about a minute after a destroy before re-creating. Before merging an infra PR while the stack is torn
-down, reject the pending `terraform-iac` apply run (or merge later), otherwise approving it re-creates the stack.
+```bash
+AWS_PROFILE=sls-dev-admin terraform -chdir=infra/terraform/bootstrap init
+```
+
+```bash
+AWS_PROFILE=sls-dev-admin terraform -chdir=infra/terraform/bootstrap plan -var-file=accounts/dev.tfvars -out=bootstrap.tfplan
+```
+
+Expect: only creates; the ECR repository `sls-dev-app`, the roles `sls-dev-gha-plan`, `-apply`, `-deploy`, the
+boundary `sls-dev-app-boundary`, the state bucket, the OIDC provider, the budget, the trail and the alert topic.
+
+```bash
+AWS_PROFILE=sls-dev-admin terraform -chdir=infra/terraform/bootstrap apply bootstrap.tfplan
+```
+
+Delete `backend_override.tf` and `bootstrap.tfplan`, then move the state into the bucket:
+
+```bash
+AWS_PROFILE=sls-dev-admin terraform -chdir=infra/terraform/bootstrap init -migrate-state -backend-config="bucket=sls-dev-tfstate-<DEV_ACCOUNT_ID>-ap-southeast-1-an"
+```
+
+Expect: a second `plan -var-file=accounts/dev.tfvars` shows no changes. Confirm the SNS subscription email.
+
+### 2. GitHub settings
+
+Create environment `dev` (you as reviewer, `main` only) in the web UI, then set each secret (each command
+prompts for the value; the role ARNs are bootstrap outputs):
+
+```bash
+gh secret set AWS_ACCOUNT_ID --env dev
+```
+
+```bash
+gh secret set AWS_APPLY_ROLE_ARN --env dev
+```
+
+```bash
+gh secret set AWS_DEPLOY_ROLE_ARN --env dev
+```
+
+```bash
+gh secret set AWS_PLAN_ROLE_ARN_DEV
+```
+
+```bash
+gh secret set AWS_ACCOUNT_ID_DEV
+```
+
+```bash
+gh variable set AWS_REGION --body ap-southeast-1
+```
+
+### 3. First image, then the env stack, then the secret
+
+The function can only be created from an image that is already in ECR (ADR 0012 L3). In the web UI: Actions >
+**App Deploy** > Run workflow (branch `main`, `mode` = `deploy`), approve `deploy (dev)`.
+
+Expect: the run is green with the notice "function not created yet"; the image is in `sls-dev-app`.
+
+Then Actions > **Terraform** > Run workflow (`env` = `dev`), approve the apply.
+
+Expect: the plan creates only `module.app_lambda.*` resources (function, alias, API, integration, route, stage,
+permission, two log groups, three alarms, secret shell, execution role and its policy).
+
+Set the secret value, in one line, in your own terminal:
+
+```bash
+AWS_PROFILE=sls-dev-admin aws secretsmanager put-secret-value --region ap-southeast-1 --secret-id sls/dev/app-api-key --secret-string "$(openssl rand -hex 24)" --query Name --output text
+```
+
+Expect: `sls/dev/app-api-key`.
+
+### 4. Deploy, then check
+
+Actions > **App Deploy** > Run workflow (`mode` = `deploy`, `strategy` = `all-at-once`), approve.
+
+```bash
+AWS_PROFILE=sls-dev-admin aws apigatewayv2 get-apis --region ap-southeast-1 --query "Items[?Name=='sls-dev-api'].ApiEndpoint" --output text
+```
+
+Expect: `https://<api-id>.execute-api.ap-southeast-1.amazonaws.com`.
+
+```bash
+curl -s https://<api-id>.execute-api.ap-southeast-1.amazonaws.com/version
+```
+
+Expect: `{"env": "dev", "git_sha": "<sha>", "image_digest": "sha256:<64 hex>"}`, the same digest the run summary
+shows and the one ECR holds for the tag `<sha>`.
+
+```bash
+AWS_PROFILE=sls-dev-admin aws lambda get-alias --region ap-southeast-1 --function-name sls-dev-app --name live --query FunctionVersion --output text
+```
+
+Expect: the version number the run published.
+
+Cold start numbers for [`docs/tradeoffs.md`](docs/tradeoffs.md) section 14: open the latest `REPORT` line with
+`Init Duration` in the log group `/aws/lambda/sls-dev-app` (CloudWatch console).
+
+### 5. Canary
+
+Merge an app change, approve the push deploy as usual, then: Actions > **App Deploy** > Run workflow
+(`strategy` = `canary`, `canary_percent` = `10`, `bake_minutes` = `5`) on the next change.
+
+```bash
+AWS_PROFILE=sls-dev-admin aws lambda get-alias --region ap-southeast-1 --function-name sls-dev-app --name live --query RoutingConfig
+```
+
+Expect during the bake: `{"AdditionalVersionWeights": {"<new>": 0.1}}`; after a green run: `null`, and
+`FunctionVersion` is the new version.
+
+### 6. Broken build never gets traffic
+
+On a branch, make `/health` return 500 (for example set `BREAK=true` as the default in `board.py`), merge it
+through a PR, approve the deploy.
+
+Expect: the run fails at the smoke invoke; `get-alias` still shows the previous version; the API still serves the
+previous `/version`. Revert the change with a PR.
+
+### 7. Rollback in dev
+
+Actions > **App Deploy** > Run workflow (`mode` = `rollback`, `sha` = an earlier SHA that was deployed to dev).
+
+Expect: the summary says the version was reused (no new version published), and `/version` shows the earlier SHA
+and digest within seconds.
+
+### 8. Prod: account, bootstrap, promote, rollback
+
+Create the prod account in AWS Organizations and an SSO profile `sls-prod-admin`. Fill
+`accounts/prod.tfvars` (with `promotion_source_account_id`), then repeat step 1 with `sls-prod-admin`,
+`accounts/prod.tfvars` and the prod bucket name. Then uncomment `promotion_target_account_id` in
+`accounts/dev.tfvars` and re-apply the dev bootstrap:
+
+```bash
+AWS_PROFILE=sls-dev-admin terraform -chdir=infra/terraform/bootstrap init -reconfigure -backend-config="bucket=sls-dev-tfstate-<DEV_ACCOUNT_ID>-ap-southeast-1-an"
+```
+
+```bash
+AWS_PROFILE=sls-dev-admin terraform -chdir=infra/terraform/bootstrap plan -var-file=accounts/dev.tfvars -out=bootstrap.tfplan
+```
+
+Expect: 0 to add, 1 to change (`aws_ecr_repository_policy.app`, statement `PromotionPull` added), 0 to destroy.
+
+```bash
+AWS_PROFILE=sls-dev-admin terraform -chdir=infra/terraform/bootstrap apply bootstrap.tfplan
+```
+
+Create environment `prod` and its secrets as in step 2 (`--env prod`, `AWS_PLAN_ROLE_ARN_PROD`,
+`AWS_ACCOUNT_ID_PROD`). Prod also needs a first image before its stack: run **App Promote** (`env` = `prod`,
+`sha` = the SHA dev serves) and approve; expect a green run with the notice "function not created yet". Then
+**Terraform** with `env` = `prod`, then the prod secret:
+
+```bash
+AWS_PROFILE=sls-prod-admin aws secretsmanager put-secret-value --region ap-southeast-1 --secret-id sls/prod/app-api-key --secret-string "$(openssl rand -hex 24)" --query Name --output text
+```
+
+Run **App Promote** again with the same SHA and approve. Expect: prod `/version` shows the **same digest** as dev.
+
+Rollback: **App Promote** with an earlier green SHA. Expect: prod `/version` shows the earlier digest within
+seconds; when prod already had a version for it, the summary says reused.
+
+### 9. Negative check: the deploy role cannot pass a role
+
+```bash
+AWS_PROFILE=sls-dev-admin aws iam simulate-principal-policy --policy-source-arn arn:aws:iam::<DEV_ACCOUNT_ID>:role/sls-dev-gha-deploy --action-names iam:PassRole lambda:DeleteFunction --resource-arns arn:aws:iam::<DEV_ACCOUNT_ID>:role/sls-dev-app-exec --query "EvaluationResults[].[EvalActionName,EvalDecision]" --output text
+```
+
+Expect: `iam:PassRole explicitDeny` and `lambda:DeleteFunction implicitDeny` (the role ARN is not a qualified
+function ARN).
+
+### 10. Teardown
+
+Prod after its checkpoint, dev when you are done with the lab (dev has no hourly cost and may stay up). Actions >
+**Terraform Destroy**, `env` = `prod`, type **destroy-prod**, approve; then the same with **destroy-dev**.
+
+```bash
+AWS_PROFILE=sls-dev-admin aws lambda get-function --region ap-southeast-1 --function-name sls-dev-app --query Configuration.FunctionName --output text
+```
+
+Expect: `ResourceNotFoundException`.
+
+```bash
+AWS_PROFILE=sls-dev-admin aws apigatewayv2 get-apis --region ap-southeast-1 --query "Items[?Name=='sls-dev-api'].ApiId" --output text
+```
+
+Expect: empty.
+
+```bash
+AWS_PROFILE=sls-dev-admin aws secretsmanager list-secrets --region ap-southeast-1 --filters Key=name,Values=sls/dev/ --query "SecretList[].Name" --output text
+```
+
+Expect: empty.
+
+The bootstrap (and its ECR images) stays until the end of the lab. Removing it follows the template's order:
+migrate the bootstrap state back to local, empty the state bucket including all versions, then a saved
+`plan -destroy` and its apply, as admin, per account (ECR goes with it: `force_delete`).
 
 ## Cost
 
-Prices for `ap-southeast-1`, on demand, at the time of writing (see the AWS pricing pages for
-[Elastic Load Balancing](https://aws.amazon.com/elasticloadbalancing/pricing/),
-[Fargate](https://aws.amazon.com/fargate/pricing/),
-[public IPv4 addresses](https://aws.amazon.com/vpc/pricing/) and
-[Secrets Manager](https://aws.amazon.com/secrets-manager/pricing/)):
+Nothing in the env stack bills per hour. Lambda (512 MB, about 0.1 s per request) and HTTP API bill per request;
+lab traffic stays inside the Lambda always-free tier (1 million requests and 400,000 GB-seconds a month) and costs
+cents on the HTTP API. The secret is about 0.40 USD a month per account, ECR storage and logs a few cents. US
+reference rates; check the ap-southeast-1 pages for
+[Lambda](https://aws.amazon.com/lambda/pricing/), [API Gateway](https://aws.amazon.com/api-gateway/pricing/) and
+[Secrets Manager](https://aws.amazon.com/secrets-manager/pricing/). The budget alert at 80 percent of 20 USD stays.
 
-| Item | Hourly (USD) |
-|---|---|
-| ALB | 0.0252 |
-| ALB capacity (LCU, upper bound: lab traffic is a small fraction of one LCU) | up to 0.008 |
-| Fargate task: 0.25 vCPU x 0.05056 + 0.5 GB x 0.00553 | 0.0154 |
-| Public IPv4: two ALB nodes and one task, 3 x 0.005 | 0.015 |
-| Secret | about 0.0006 |
-| **Total while the stack is up** | **about 0.056 to 0.064** |
+## Agent team (Claude Code plugin `sis-team`)
 
-That is 0.17 to 0.19 USD for a 3-hour session, or 1.35 to 1.54 USD a day. Left running for 30 days it would
-cost about 40 to 46 USD, twice the 20 USD budget; the 80% budget alert would fire after about 10 to 12 days.
-ECR storage, logs, the S3 state bucket and the budget cost cents, and GitHub-hosted minutes are free on a
-public repo. **Destroy `envs/dev` at the end of every session.**
-
-## Teardown order
-
-Every session: `terraform-destroy` for `dev`, as in the session flow above. The bootstrap stack stays.
-
-End of the lab ([requirements, cost and cleanup](docs/requirements.md#cost-and-cleanup)), in this order:
-
-1. `terraform-destroy` for every environment (prod first). Run it once more and check it
-   reports "nothing to destroy".
-2. Bootstrap, per account, as admin, locally (CI can never touch the bootstrap state). From
-   `infra/terraform/bootstrap`, with `AWS_PROFILE=sis-dev-admin`:
-   1. Move the state back to local: write a `backend_override.tf` containing `terraform { backend "local" {} }`,
-      run `terraform init -migrate-state -force-copy`, and check `terraform state list`.
-   2. Before emptying anything, check that nothing is left: `terraform -chdir=infra/terraform/envs/dev state list`
-      prints nothing (after an `init` with the backend config), and the per-service checks of ADR 0006 checkpoint
-      step 8 find no cluster, ALB, VPC, ECR repository or secret (the Tagging API lags behind deletes, so do not
-      rely on it). Then empty the state bucket
-      `sis-dev-tfstate-<DEV_ACCOUNT_ID>-ap-southeast-1-an`, including every object version and delete marker (the
-      bucket has `force_destroy = false`): list them with `aws s3api list-object-versions` and remove them with
-      `aws s3api delete-objects`, at most 1000 keys per call. Double-check the bucket name: deleted versions
-      cannot be recovered.
-   3. `terraform plan -destroy -var-file=accounts/dev.tfvars -out=destroy.tfplan`, read it, then apply that
-      saved plan.
-   4. Delete `backend_override.tf`, `destroy.tfplan` and the local state files.
-3. Optionally delete the GitHub environment `dev` and the repo and environment secrets, which now point at
-   deleted roles. Service-linked roles and `INACTIVE` task definitions cost nothing and can stay.
-
-Troubleshooting:
-
-- **Stale state lock** after a cancelled or crashed run: first check in Actions that no `terraform-iac` or
-  `terraform-destroy` run is running or waiting (a destroy can legitimately hold the lock for over 30 minutes
-  while the ALB network interfaces drain), and that the lock's `Who` and `Created` match the run that died.
-  Only then, as admin: `terraform -chdir=infra/terraform/envs/dev init -backend-config="bucket=<state bucket>"`
-  and `terraform -chdir=infra/terraform/envs/dev force-unlock <lock id>`. Never from CI. Unlocking a live lock
-  lets two runs write the state, which can orphan billable resources.
-- **A pending run disappeared:** `terraform-iac` apply and `terraform-destroy` share one concurrency group, so
-  a newer pending run replaces an older pending one. Start the one you want again.
-- **Re-create fails on the secret name:** wait a minute after a destroy; the secret is deleted immediately
-  (`recovery_window_in_days = 0`), but the name can take a moment to free up.
-
-## Release strategy
-
-| Env | Strategy | Why |
-|---|---|---|
-| dev | ECS `ROLLING` with the deployment circuit breaker and automatic rollback (built) | Cheap and simple; `scripts/ecs/wait-deployment.sh` fails the run on a rollback |
-| prod | `ROLLING` with the circuit breaker, like dev. `app-promote` copies the dev digest; **rollback promotes an earlier green SHA**, whose image is already in prod | The goal is the deployment path ([requirements](docs/requirements.md#the-deployment-path-v3), ADR 0010): one digest from `main` to prod, and a rollback with no rebuild |
-| Later | ECS built-in `BLUE_GREEN`, `CANARY` or `LINEAR` | Need real traffic and alarms that mean something: 10% of almost no requests gives no signal. `BLUE_GREEN` was designed in ADR 0008 and left out by amendment S |
-
-Branching is trunk-based (FR-14): merge to `main` deploys dev, and `app-promote` (`workflow_dispatch` with a
-green SHA) promotes the same image digest to prod. No `develop` or per-env branches.
-
-## When to move to CodeBuild runners or CodePipeline
-
-**Stay on GitHub-hosted runners and GitHub Actions for this lab.** They are free on a public repo, and every
-trust condition above is built on their OIDC token.
-
-**CodeBuild-hosted runners** keep these workflows and change `runs-on` to a CodeBuild project label. Move when
-jobs need private VPC access (database migrations, private endpoints), larger, ARM or GPU compute, or egress
-control inside your VPC. Trade-offs:
-
-- They cost build minutes, while hosted minutes are free here.
-- GitHub advises against self-hosted runners on public repos, and this repo is public.
-- The CodeBuild project's service role gives credentials to any job that targets its label, which bypasses the
-  `sub`, `ref` and `job_workflow_ref` trust. If you move, give that role nothing beyond logs and keep assuming the OIDC
-  roles from the job.
-- A GitHub connection credential then lives in AWS.
-
-**CodePipeline (V2)** fits when the organisation needs AWS-native approvals and audit (CloudTrail),
-cross-account promotion with AWS identities only (the Phase 7 prod account), or deploys that must not depend
-on GitHub Actions being available. The pieces would be a CodeConnections GitHub source (push, PR and tag
-triggers), a manual approval action, and the ECS deploy action (or CodeDeploy for blue/green). Its ECS action
-builds from the service's current revision, not Terraform's latest family revision, which differs from how
-`app-deploy` works here (ADR 0005 F3).
-
-## Phases
-
-Each phase has its decisions and checkpoint results in one ADR under [`docs/adr/`](docs/adr/).
-
-| Phase | Needs AWS? | You do by hand |
-|---|---|---|
-| 0 Scaffold + local app | No | `docker compose up`, check `/`, `/admin`, `BREAK=true` |
-| 1 Bootstrap dev account | **Yes**: dev account ID, SSO admin login, budget email | Apply bootstrap, migrate state, GitHub environment `dev` and secrets |
-| 2 OIDC smoke test | Yes (roles from Phase 1) | Set secret `AWS_PLAN_ROLE_ARN_DEV`, read the assumed-role ARN in the PR run, run N1 after merge |
-| 3 Infra pipeline + ECS | Yes | Re-apply bootstrap, environment `dev` and secrets, approve apply, `put-secret-value`, negative tests, teardown |
-| 4 App pipeline | Yes | Environment secret `AWS_DEPLOY_ROLE_ARN`, re-create the stack, approve `app-deploy`, verify the digest, merge the one-line checkpoint PR, negative tests, teardown |
-| 5 Hardening and teardown | Yes | Re-apply bootstrap (deploy role reads secret metadata), re-create, negative tests N5 and N6, destroy through `terraform-destroy`, N7 |
-| 6 Supply-chain hardening | Yes | Read the `job_workflow_ref` claim, re-apply bootstrap (file-pinned trust, region pin, trail and alert), confirm the alert email, read harden-runner insights, merge and prove the new trust with a re-create, deploy and destroy round, require `guard (no AWS)`. Then PR B: block mode from the collected egress list |
-| 7 Prod account, promote and rollback | **Yes**: a prod account in AWS Organizations, SSO admin login | Create the prod account, bootstrap it, re-apply the dev bootstrap, environment `prod` and secrets, promote A, B, then A again (rollback), N1 and N10, teardown (ADR 0008 "PR B2 checkpoint") |
-| 8 PR preview environments | Deferred (ADR 0010) | Design kept in ADR 0009 |
+The plugin in [`plugins/sis-team/`](plugins/sis-team/) comes from the template and still describes the ECS lab in
+places; updating it, `CLAUDE.md` and `.claude/skills/` is an open owner item (ADR 0012 Q-A).

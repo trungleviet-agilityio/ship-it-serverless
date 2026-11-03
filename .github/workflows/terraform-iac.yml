@@ -34,7 +34,6 @@ on:
       - scripts/aws/assert-no-account-id.sh
       - scripts/names.sh
       - scripts/tf/plan-role-guardrails.sh
-      - scripts/tf/mask-cidrs.sh
       - scripts/aws/redact-account-ids.sh
       - scripts/lib.sh
       - project.env
@@ -128,10 +127,6 @@ jobs:
     secrets:
       AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID_DEV }}
       AWS_PLAN_ROLE_ARN: ${{ secrets.AWS_PLAN_ROLE_ARN_DEV }}
-      ALB_INGRESS_CIDRS: ${{ secrets.ALB_INGRESS_CIDRS_DEV }}
-      # dev promotes to prod (terraform.tfvars promotion_target_env): the dev ECR repository policy names the prod
-      # account (ADR 0008 P9). The only cross-env secret a caller may map; the parity guard checks it.
-      PROMOTION_TARGET_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID_PROD }}
 
   plan-prod:
     name: plan (prod)
@@ -150,7 +145,6 @@ jobs:
     secrets:
       AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID_PROD }}
       AWS_PLAN_ROLE_ARN: ${{ secrets.AWS_PLAN_ROLE_ARN_PROD }}
-      ALB_INGRESS_CIDRS: ${{ secrets.ALB_INGRESS_CIDRS_PROD }}
 
   apply:
     name: apply
@@ -161,8 +155,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     # The environment adds the required reviewer and sets the OIDC subject the apply role trusts. Its secrets
-    # (AWS_ACCOUNT_ID, AWS_APPLY_ROLE_ARN, ALB_INGRESS_CIDRS) belong to that environment, under the same names in each.
-    # ALB_INGRESS_CIDRS is required: the apply fails while it is empty (a JSON list, or ["0.0.0.0/0"] to be open).
+    # (AWS_ACCOUNT_ID, AWS_APPLY_ROLE_ARN) belong to that environment, under the same names in each.
     environment: ${{ inputs.env || 'dev' }}
     concurrency:
       group: terraform-envs-${{ inputs.env || 'dev' }}
@@ -184,9 +177,10 @@ jobs:
             registry.terraform.io:443
             sts.${{ vars.AWS_REGION }}.amazonaws.com:443
             sls-${{ env.ENV }}-tfstate-${{ secrets.AWS_ACCOUNT_ID }}-${{ vars.AWS_REGION }}-an.s3.${{ vars.AWS_REGION }}.amazonaws.com:443
-            ec2.${{ vars.AWS_REGION }}.amazonaws.com:443
-            elasticloadbalancing.${{ vars.AWS_REGION }}.amazonaws.com:443
-            ecs.${{ vars.AWS_REGION }}.amazonaws.com:443
+            lambda.${{ vars.AWS_REGION }}.amazonaws.com:443
+            apigateway.${{ vars.AWS_REGION }}.amazonaws.com:443
+            monitoring.${{ vars.AWS_REGION }}.amazonaws.com:443
+            sns.${{ vars.AWS_REGION }}.amazonaws.com:443
             api.ecr.${{ vars.AWS_REGION }}.amazonaws.com:443
             logs.${{ vars.AWS_REGION }}.amazonaws.com:443
             secretsmanager.${{ vars.AWS_REGION }}.amazonaws.com:443
@@ -197,10 +191,8 @@ jobs:
         with:
           persist-credentials: false
 
-      # Select the root, install the tools, check the config, assume the apply role, init and mask the CIDRs. The
-      # apply refuses an empty ALB_INGRESS_CIDRS before the role is assumed: unset would open the ALB to 0.0.0.0/0
-      # while the PR plan (repository secret ALB_INGRESS_CIDRS_<ENV>) looked restricted. To open it on purpose, set the
-      # environment secret to ["0.0.0.0/0"]. A local action: it needs the checkout above.
+      # Select the root, install the tools, check the config, assume the apply role and init. A local action: it needs
+      # the checkout above.
       - name: Set up Terraform with the apply role
         uses: ./.github/actions/terraform-setup # zizmor: ignore[self-repository]
         with:
@@ -210,17 +202,11 @@ jobs:
           account-id: ${{ secrets.AWS_ACCOUNT_ID }}
           region: ${{ vars.AWS_REGION }}
           session-prefix: apply
-          alb-ingress-cidrs: ${{ secrets.ALB_INGRESS_CIDRS }}
-          require-alb-ingress-cidrs: "true"
 
       # A fresh plan of main inside the approved job, not a saved PR plan (ADR 0004, E24, R5).
       - name: Terraform plan
         env:
           TF_VAR_aws_account_id: ${{ secrets.AWS_ACCOUNT_ID }}
-          TF_VAR_alb_ingress_cidrs_json: ${{ secrets.ALB_INGRESS_CIDRS }}
-          # Environment secret of dev only (the prod account, for the dev ECR repository policy, ADR 0008 P9). Unset in
-          # prod, where terraform.tfvars sets no promotion target and the value is ignored.
-          TF_VAR_promotion_target_account_id: ${{ secrets.PROMOTION_TARGET_ACCOUNT_ID }}
         run: terraform -chdir="$TF_DIR" plan -lock-timeout=5m -no-color -out=tfplan
 
       - name: Summarize the plan
@@ -239,13 +225,13 @@ jobs:
       - name: Report the result
         run: |
           set -euo pipefail
-          alb_url="$(terraform -chdir="$TF_DIR" output -raw alb_url)"
+          api_url="$(terraform -chdir="$TF_DIR" output -raw api_endpoint)"
           role="$(scripts/names.sh role 2>/dev/null)" || role="not assumed"
           {
             echo "### Applied"
-            echo "ALB URL: ${alb_url}"
+            echo "API endpoint: ${api_url}"
             echo "Role: \`${role}\`"
-            echo "The service stays unhealthy until the secret value is set and app-deploy runs (Run workflow)."
+            echo "The app answers 401 on /admin until the secret value is set; app-deploy (Run workflow) releases new images."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Remove the plan file

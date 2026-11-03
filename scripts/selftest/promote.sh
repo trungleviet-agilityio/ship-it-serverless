@@ -31,8 +31,12 @@ git_in checkout -q main
 resolve() { (cd "$repo" && stubbed "$ROOT/scripts/image/promote-resolve.sh" "$@"); }
 # run_list <sha> <conclusion> <branch> <event>: one run in the answer of `gh run list`.
 run_list() { printf '[{"databaseId": 77, "headSha": "%s", "conclusion": "%s", "headBranch": "%s", "event": "%s"}]' "$1" "$2" "$3" "$4"; }
-# run_jobs <build conclusion> <deploy conclusion>: the answer of `gh run view --json jobs`.
-run_jobs() { printf '{"jobs": [{"name": "build, scan", "conclusion": "%s"}, {"name": "deploy (dev)", "conclusion": "%s"}]}' "$1" "$2"; }
+# run_jobs <build conclusion> <deploy conclusion> [release step conclusion]: the answer of `gh run view --json jobs`. The
+# release step (Verify live through the API) concludes like the deploy job unless given.
+run_jobs() {
+  printf '{"jobs": [{"name": "build, scan", "conclusion": "%s", "steps": []}, {"name": "deploy (dev)", "conclusion": "%s", "steps": [{"name": "Publish the version", "conclusion": "%s"}, {"name": "Verify live through the API", "conclusion": "%s"}]}]}' \
+    "$1" "$2" "${3:-$2}" "${3:-$2}"
+}
 # green_run <sha>: a push run on main whose deploy job succeeded.
 green_run() {
   stub gh-run-list out "$(run_list "$1" success main push)"
@@ -96,8 +100,18 @@ stub gh-run-view out "$(run_jobs success failure)"
 expect_fail "resolve with the deploy job failed" "never deployed to dev" resolve "$sha_a"
 stub_reset
 stub gh-run-list out "$(run_list "$sha_a" success main push)"
-stub gh-run-view out '{"jobs": [{"name": "deploy (prod)", "conclusion": "success"}]}'
+stub gh-run-view out '{"jobs": [{"name": "deploy (prod)", "conclusion": "success", "steps": [{"name": "Verify live through the API", "conclusion": "success"}]}]}'
 expect_fail "resolve with only a job of another name" "never deployed to dev" resolve "$sha_a"
+# The first run of an environment ends green with the function not created yet: nothing was released, so the image
+# was never smoke-tested on Lambda (ADR 0012 L3).
+stub_reset
+stub gh-run-list out "$(run_list "$sha_a" success main push)"
+stub gh-run-view out "$(run_jobs success success skipped)"
+expect_fail "resolve with a green deploy that released nothing" "never deployed to dev" resolve "$sha_a"
+stub_reset
+stub gh-run-list out "$(run_list "$sha_a" success main push)"
+stub gh-run-view out '{"jobs": [{"name": "deploy (dev)", "conclusion": "success"}]}'
+expect_fail "resolve with a deploy job without steps" "never deployed to dev" resolve "$sha_a"
 stub_reset
 stub gh-run-list out "$(run_list "$sha_a" success main push)"
 stub gh-run-view rc 1

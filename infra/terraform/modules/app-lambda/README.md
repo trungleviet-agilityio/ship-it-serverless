@@ -62,4 +62,70 @@ module "app_lambda" {
 Offline checks: `make tf-check` runs `terraform test` with a mocked provider, plus the `tf/policy.sh` rules.
 
 <!-- BEGIN_TF_DOCS -->
+## Requirements
+
+| Name | Version |
+| ---- | ------- |
+| terraform | >= 1.11, < 2.0 |
+| aws | ~> 6.70 |
+
+## Providers
+
+| Name | Version |
+| ---- | ------- |
+| aws | 6.70.0 |
+
+## Resources
+
+| Name | Type |
+| ---- | ---- |
+| [aws_apigatewayv2_api.this](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/apigatewayv2_api) | resource |
+| [aws_apigatewayv2_integration.app](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/apigatewayv2_integration) | resource |
+| [aws_apigatewayv2_route.default](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/apigatewayv2_route) | resource |
+| [aws_apigatewayv2_stage.default](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/apigatewayv2_stage) | resource |
+| [aws_cloudwatch_log_group.api](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_log_group) | resource |
+| [aws_cloudwatch_log_group.lambda](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_log_group) | resource |
+| [aws_cloudwatch_metric_alarm.api_5xx](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_metric_alarm) | resource |
+| [aws_cloudwatch_metric_alarm.lambda_errors](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_metric_alarm) | resource |
+| [aws_cloudwatch_metric_alarm.lambda_throttles](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_metric_alarm) | resource |
+| [aws_iam_role.exec](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role) | resource |
+| [aws_iam_role_policy.exec](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role_policy) | resource |
+| [aws_lambda_alias.live](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lambda_alias) | resource |
+| [aws_lambda_function.app](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lambda_function) | resource |
+| [aws_lambda_permission.api](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lambda_permission) | resource |
+| [aws_secretsmanager_secret.app](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/secretsmanager_secret) | resource |
+
+## Inputs
+
+| Name | Description | Type | Default | Required |
+| ---- | ----------- | ---- | ------- | :------: |
+| aws_region | AWS region of the stack. Used for the ECR repository URL. | `string` | n/a | yes |
+| env | Environment name. | `string` | n/a | yes |
+| prefix | Name prefix for every resource. Must equal the bootstrap prefix (name contract, ADR 0002). | `string` | n/a | yes |
+| alarm_topic_arn | SNS topic for the three alarms (the bootstrap <prefix>-<env>-security-alerts topic). Null: alarms without actions. | `string` | `null` | no |
+| api_throttle_burst_limit | Burst of requests the HTTP API stage accepts above the rate (ADR 0012 L2). | `number` | `10` | no |
+| api_throttle_rate_limit | Steady-state requests per second the HTTP API stage accepts (ADR 0012 L2, R1: the cost ceiling). | `number` | `5` | no |
+| log_retention_days | Retention of the function and API access log groups. | `number` | `7` | no |
+| memory_mb | Function memory in MB (ADR 0012 L1: 512). CPU scales with it; so does the GB-second price. | `number` | `512` | no |
+| reserved_concurrency | Reserved concurrency of the function (ADR 0012 L10). Null: no reservation. Lambda refuses a reservation that leaves less than 100 unreserved, so accounts with a low quota must keep null (Finding 10). | `number` | `null` | no |
+| secret_recovery_window_days | Secrets Manager recovery window. 0 deletes at once, so a torn-down stack can be re-created (ADR 0004, Q3). | `number` | `0` | no |
+| timeout_s | Function timeout in seconds (ADR 0012 L1: 10). At most 30, the HTTP API integration limit. | `number` | `10` | no |
+
+## Outputs
+
+| Name | Description |
+| ---- | ----------- |
+| alias_name | Alias the HTTP API invokes; App Deploy moves it. |
+| api_endpoint | Public HTTPS endpoint of the HTTP API ($default stage, so no stage path). |
+| api_id | HTTP API ID. |
+| api_log_group_name | HTTP API access log group. |
+| ecr_repository_name | ECR repository name (owned by bootstrap, ADR 0012 L4). |
+| ecr_repository_url | ECR repository URL of the bootstrap repository (holds the account ID, so the root does not re-export it). |
+| exec_role_arn | Execution role ARN. |
+| exec_role_name | Execution role name. |
+| function_arn | Lambda function ARN (holds the account ID, so the root does not re-export it). |
+| function_name | Lambda function name. |
+| lambda_log_group_name | Function log group. |
+| secret_arn | Secret ARN the app reads (APP_API_KEY_SECRET_ARN). |
+| secret_name | Secrets Manager secret name. |
 <!-- END_TF_DOCS -->

@@ -7,13 +7,12 @@
 # Env:   ENV            environment name (heading suffix)
 #        DELETES        deletes in the checked plan; empty when the plan check did not finish
 #        APPLY_OUTCOME  outcome of the apply step (success, failure, skipped, cancelled)
-#        DEREGISTERED   task definition revisions deregistered; empty when the cleanup did not start
 #        ROLE           name of the assumed role
 
 # shellcheck source=scripts/lib.sh
 source "$(dirname "$0")/../lib.sh"
 
-[ $# -eq 0 ] || die "usage: scripts/tf/destroy-report.sh (reads ENV, DELETES, APPLY_OUTCOME, DEREGISTERED, ROLE)"
+[ $# -eq 0 ] || die "usage: scripts/tf/destroy-report.sh (reads ENV, DELETES, APPLY_OUTCOME, ROLE)"
 env_name="${ENV:?ENV is not set}"
 deletes="${DELETES:-}"
 outcome="${APPLY_OUTCOME:-}"
@@ -34,5 +33,4 @@ fi
 
 echo "### ${heading} (${env_name})"
 echo "$detail"
-echo "Task definition revisions deregistered: ${DEREGISTERED:-not known (the cleanup did not start)}"
 echo "Role: \`${ROLE:-not assumed}\`"

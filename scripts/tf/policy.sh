@@ -89,8 +89,8 @@ report 2 "dynamic or list-valued ingress/egress under modules/ (use standalone r
 
 # (3) Inline role policies only; no managed Lambda execution policy (AWSLambdaBasicExecutionRole allows
 # logs:CreateLogGroup on *, ADR 0012 L9).
-report 3 "AWSLambda*ExecutionRole managed policies are forbidden under modules/ (inline least-privilege policy)" \
-  "$(scan 'AWSLambda[A-Za-z]*ExecutionRole' "$root/modules")"
+report 3 "AWSLambda*ExecutionRole and AmazonECSTaskExecutionRolePolicy managed policies are forbidden under modules/ (inline least-privilege policy)" \
+  "$(scan '(AWSLambda[A-Za-z]*ExecutionRole|AmazonECSTaskExecutionRolePolicy)' "$root/modules")"
 report 3 "aws_iam_role_policy_attachment is forbidden under modules/ (inline policies only)" \
   "$(scan '^[[:space:]]*resource[[:space:]]+"aws_iam_role_policy_attachment"' "$root/modules")"
 

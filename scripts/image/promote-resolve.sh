@@ -34,8 +34,11 @@ ok "${sha} is on main"
 # The run list is filtered on the API side; every field is checked again here, so a loose answer never passes. A run
 # counts only if it ran on branch main from a push or a manual dispatch (never a pull_request run), and its job
 # "deploy (dev)" itself concluded success: a run whose jobs were all skipped (a tag named main, a dispatch on an old
-# commit) has the conclusion success too, so the run conclusion alone proves nothing.
+# commit) has the conclusion success too, so the run conclusion alone proves nothing. The job must also have released
+# the commit: its step "Verify live through the API" concluded success. The first run of an environment ends green with
+# the function not created yet and that step skipped (ADR 0012 L3), and such an image was never smoke-tested on Lambda.
 deploy_job="deploy (dev)"
+release_step="Verify live through the API"
 run_capture gh run list --workflow app-deploy.yml --commit "$sha" --branch main --status success \
   --json databaseId,headSha,headBranch,event,conclusion --limit 20
 [ "$RUN_RC" -eq 0 ] || die "gh run list failed (exit code ${RUN_RC}): ${RUN_ERR}"
@@ -50,10 +53,12 @@ for run_id in $candidates; do
   [[ "$run_id" =~ ^[0-9]+$ ]] || die "gh run list returned a run id that is not a number"
   run_capture gh run view "$run_id" --json jobs
   [ "$RUN_RC" -eq 0 ] || die "gh run view failed (exit code ${RUN_RC}): ${RUN_ERR}"
-  if jq -e --arg name "$deploy_job" 'any(.jobs[]?; .name == $name and .conclusion == "success")' <<<"$RUN_OUT" >/dev/null 2>&1; then
+  if jq -e --arg name "$deploy_job" --arg step "$release_step" '
+    any(.jobs[]?; .name == $name and .conclusion == "success"
+      and any(.steps[]?; .name == $step and .conclusion == "success"))' <<<"$RUN_OUT" >/dev/null 2>&1; then
     green=1
     break
   fi
 done
-[ "$green" = 1 ] || die "no app-deploy run for ${sha} has its job '${deploy_job}' succeeded (skipped or failed); it was never deployed to dev"
-ok "${sha} has a successful '${deploy_job}' job in an app-deploy run on main"
+[ "$green" = 1 ] || die "no app-deploy run for ${sha} has its job '${deploy_job}' succeeded with the step '${release_step}' (skipped or failed); it was never deployed to dev"
+ok "${sha} has a successful '${deploy_job}' job that released it in an app-deploy run on main"

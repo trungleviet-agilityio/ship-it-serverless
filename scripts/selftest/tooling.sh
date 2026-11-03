@@ -22,8 +22,8 @@ expect_fail "die inside GitHub Actions" "::error::boom" env GITHUB_ACTIONS=true 
 run_capture bash -c "echo out; echo 'bad ${acct}' >&2; exit 3"
 { [ "$RUN_RC" -eq 3 ] && [ "$RUN_OUT" = "out" ] && [ "$RUN_ERR" = "bad <redacted>" ]; } || die "selftest: run_capture recorded rc=$RUN_RC out=$RUN_OUT err=$RUN_ERR"
 names="$(ENV=prod "$ROOT/scripts/names.sh" app)"
-[ "$names" = "$(printf 'CLUSTER=sis-prod-cluster\nSERVICE=sis-prod-app\nFAMILY=sis-prod-app\nREPOSITORY=sis-prod-app')" ] || die "selftest: names app printed: $names"
-[ "$("$ROOT/scripts/names.sh" app | head -n1)" = "CLUSTER=sis-dev-cluster" ] || die "selftest: names app must default to dev"
+[ "$names" = "$(printf 'FUNCTION=sis-prod-app\nALIAS=live\nAPI=sis-prod-api\nREPOSITORY=sis-prod-app\nSECRET_ID=sis/prod/app-api-key')" ] || die "selftest: names app printed: $names"
+[ "$("$ROOT/scripts/names.sh" app | head -n1)" = "FUNCTION=sis-dev-app" ] || die "selftest: names app must default to dev"
 [ "$("$ROOT/scripts/names.sh" image "$commit")" = "sis-app:${commit}" ] || die "selftest: names image printed the wrong name"
 [ "$(ENV=dev "$ROOT/scripts/names.sh" env-root)" = "infra/terraform/envs/dev" ] || die "selftest: names env-root printed the wrong root"
 [ "$("$ROOT/scripts/names.sh" env-root)" = "infra/terraform/envs/dev" ] || die "selftest: names env-root must default to dev"
@@ -127,7 +127,7 @@ ok "redact filter replaces 12-digit runs"
 # --- Usage contracts. The Docker-based scripts (build, smoke, scan) run in full in app-ci and in `make image smoke
 # scan`, which need Docker and the trivy database; their argument contracts are checked here, with the rest.
 # A script that takes arguments prints its usage when called with none.
-for s in image/build image/smoke ecs/render-task-def image/verify image/export image/import image/ecr-push image/promote-resolve image/promote-copy aws/check-config \
+for s in image/build image/smoke lambda/publish lambda/smoke-invoke lambda/shift-alias lambda/canary-bake lambda/verify-live lambda/resolve-image image/verify image/export image/import image/ecr-push image/promote-resolve image/promote-copy aws/check-config \
   aws/assert-web-identity-denied aws/assert-session-cap ci/venv tf/resolved-sources tf/new-env; do
   expect_fail "$s without arguments" "usage:" "$ROOT/scripts/$s.sh"
 done
@@ -135,14 +135,14 @@ expect_fail "names without arguments" "usage:" "$ROOT/scripts/names.sh"
 expect_fail "names image without a commit" "usage:" "$ROOT/scripts/names.sh" image
 expect_fail "names with an unknown kind" "usage:" "$ROOT/scripts/names.sh" other
 # A script that takes none refuses a stray argument.
-for s in ecs/preflight ecs/deregister-revisions aws/assert-no-account-id tf/plan-role-guardrails \
-  tf/init tf/destroy-check tf/plan-summary tf/mask-cidrs tf/destroy-report; do
+for s in lambda/preflight lambda/api-endpoint aws/assert-no-account-id tf/plan-role-guardrails \
+  tf/init tf/destroy-check tf/plan-summary tf/destroy-report; do
   expect_fail "$s with a stray argument" "usage:" "$ROOT/scripts/$s.sh" x
 done
 expect_fail "names app with a stray argument" "usage:" "$ROOT/scripts/names.sh" app x
 expect_fail "names role with a stray argument" "usage:" "$ROOT/scripts/names.sh" role x
 expect_fail "image/scan with one argument" "usage:" "$ROOT/scripts/image/scan.sh" image-only
-expect_fail "ecs/wait-deployment with two arguments" "usage:" "$ROOT/scripts/ecs/wait-deployment.sh" cluster service
+expect_fail "lambda/prune-versions with two arguments" "usage:" "$ROOT/scripts/lambda/prune-versions.sh" 10 x
 
 # --- OIDC helpers and the negative tests (ADR 0007 S30 to S32), with stub curl and aws.
 # b64url <text> [pad]: base64url without padding, or with it when a second argument is given.
@@ -256,29 +256,6 @@ stub "$sts" rc 254 1
 stub "$sts" err "An error occurred (AccessDenied)" 1
 expect_fail "session cap when 900 seconds is refused" "a 900 second session was refused" oidc_env "$ROOT/scripts/aws/assert-session-cap.sh" plan
 ok "session cap: 3601 refused for the duration, 900 reports its expiry"
-
-# --- tf/mask-cidrs.sh
-[ "$(CIDRS="" "$ROOT/scripts/tf/mask-cidrs.sh" 2>/dev/null)" = "::notice::ALB ingress: default 0.0.0.0/0" ] || die "selftest: an empty list must print only the notice"
-masks="$(CIDRS='["198.51.100.7/32","203.0.113.0/24"]' "$ROOT/scripts/tf/mask-cidrs.sh" 2>/dev/null)"
-[ "$masks" = "$(printf '::add-mask::198.51.100.7/32\n::add-mask::203.0.113.0/24')" ] || die "selftest: expected one add-mask per element, got: $masks"
-expect_fail "mask-cidrs with non-JSON" "must be a JSON list" env CIDRS="not json" "$ROOT/scripts/tf/mask-cidrs.sh"
-expect_fail "mask-cidrs with a JSON object" "must be a JSON list" env CIDRS='{"a":"198.51.100.7/32"}' "$ROOT/scripts/tf/mask-cidrs.sh"
-out="$(quiet_run env CIDRS="bad 198.51.100.7" "$ROOT/scripts/tf/mask-cidrs.sh")"
-case "$out" in *198.51.100.7*) die "selftest: mask-cidrs echoed a bad value" ;; esac
-ok "mask-cidrs masks each element and refuses anything but a JSON list"
-# The apply passes --require: an empty secret fails closed and the message names the secret that is read, not the
-# repository copy of the PR plan. A set value (also ["0.0.0.0/0"], open on purpose) passes and is masked.
-expect_fail "mask-cidrs --require with an empty value" "ALB_INGRESS_CIDRS is empty" env CIDRS="" ENV=qa "$ROOT/scripts/tf/mask-cidrs.sh" --require
-expect_fail "mask-cidrs --require with an unset value" "ALB_INGRESS_CIDRS is empty" env -u CIDRS ENV=qa "$ROOT/scripts/tf/mask-cidrs.sh" --require
-expect_fail "mask-cidrs --require names the environment" "of the qa environment" env CIDRS="" ENV=qa "$ROOT/scripts/tf/mask-cidrs.sh" --require
-expect_fail "mask-cidrs with a bad value names the secret" "ALB_INGRESS_CIDRS must be a JSON list" env CIDRS="x" "$ROOT/scripts/tf/mask-cidrs.sh"
-out="$(quiet_run env CIDRS="" "$ROOT/scripts/tf/mask-cidrs.sh" --require)"
-case "$out" in *ALB_INGRESS_CIDRS_DEV*) die "selftest: mask-cidrs still names the repository secret ALB_INGRESS_CIDRS_DEV" ;; esac
-[ "$(CIDRS='["0.0.0.0/0"]' "$ROOT/scripts/tf/mask-cidrs.sh" --require 2>/dev/null)" = "::add-mask::0.0.0.0/0" ] || die "selftest: --require must accept the explicit open list"
-[ "$(CIDRS='["198.51.100.7/32"]' "$ROOT/scripts/tf/mask-cidrs.sh" --require 2>/dev/null)" = "::add-mask::198.51.100.7/32" ] || die "selftest: --require must accept and mask a list"
-expect_fail "mask-cidrs with an unknown option" "usage:" env CIDRS="" "$ROOT/scripts/tf/mask-cidrs.sh" --other
-[ "$(CIDRS="" "$ROOT/scripts/tf/mask-cidrs.sh" 2>/dev/null)" = "::notice::ALB ingress: default 0.0.0.0/0" ] || die "selftest: without --require an empty value stays open (PR plan and destroy)"
-ok "mask-cidrs --require fails closed on an empty value; without it an empty value stays open"
 
 # --- Script modes (ADR 0007 S19): libraries are only sourced, so they are not executable; everything else is.
 modes="$(git -C "$ROOT" ls-files -s 'scripts/*.sh' 2>/dev/null || true)"

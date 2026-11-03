@@ -1,8 +1,8 @@
 # Approval-gated teardown of one environment (PLAN Phase 5, ADR 0006, FR-12, ADR 0008).
 # Dispatch only. The `confirm` job checks the typed phrase without any credential, so a typo fails before an
 # approval prompt exists. The `destroy` job then needs the approval of the chosen environment, plans the destroy, refuses
-# anything but deletes under module.app_ecs., applies that same saved plan and deregisters the task definition
-# revisions. Bootstrap is never destroyed here (ADR 0006, G17).
+# anything but deletes under module.app_lambda., and applies that same saved plan. The published Lambda versions go with
+# the function; the images stay in the bootstrap ECR repository. Bootstrap is never destroyed here (ADR 0006, G17).
 # The file path is part of the apply role trust (ADR 0007 S2): the bootstrap `workflow_files.apply` must list
 # terraform-destroy.yml.
 # Jobs that assume an AWS role run harden-runner in block mode with telemetry off and an exact allowlist (ADR 0007 S39).
@@ -109,9 +109,10 @@ jobs:
             registry.terraform.io:443
             sts.${{ vars.AWS_REGION }}.amazonaws.com:443
             sls-${{ env.ENV }}-tfstate-${{ secrets.AWS_ACCOUNT_ID }}-${{ vars.AWS_REGION }}-an.s3.${{ vars.AWS_REGION }}.amazonaws.com:443
-            ec2.${{ vars.AWS_REGION }}.amazonaws.com:443
-            elasticloadbalancing.${{ vars.AWS_REGION }}.amazonaws.com:443
-            ecs.${{ vars.AWS_REGION }}.amazonaws.com:443
+            lambda.${{ vars.AWS_REGION }}.amazonaws.com:443
+            apigateway.${{ vars.AWS_REGION }}.amazonaws.com:443
+            monitoring.${{ vars.AWS_REGION }}.amazonaws.com:443
+            sns.${{ vars.AWS_REGION }}.amazonaws.com:443
             api.ecr.${{ vars.AWS_REGION }}.amazonaws.com:443
             logs.${{ vars.AWS_REGION }}.amazonaws.com:443
             secretsmanager.${{ vars.AWS_REGION }}.amazonaws.com:443
@@ -122,8 +123,6 @@ jobs:
         with:
           persist-credentials: false
 
-      # A destroy plan deletes what is in state, so the optional ALB ingress secret is not passed as a variable and may
-      # be empty (a destroy must always work). Masking its elements keeps any CIDR Terraform prints out of the log.
       # A local action: it needs the checkout above.
       - name: Set up Terraform with the apply role
         id: setup
@@ -135,13 +134,10 @@ jobs:
           account-id: ${{ secrets.AWS_ACCOUNT_ID }}
           region: ${{ vars.AWS_REGION }}
           session-prefix: destroy
-          alb-ingress-cidrs: ${{ secrets.ALB_INGRESS_CIDRS }}
 
       - name: Terraform destroy plan
         env:
           TF_VAR_aws_account_id: ${{ secrets.AWS_ACCOUNT_ID }}
-          # dev only: the variable validation needs it even for a destroy (ADR 0008 P9); unset and ignored in prod.
-          TF_VAR_promotion_target_account_id: ${{ secrets.PROMOTION_TARGET_ACCOUNT_ID }}
         run: terraform -chdir="$TF_DIR" plan -destroy -lock-timeout=5m -no-color -out=tfplan
 
       # Before the guard, so a refused plan still shows its table in the summary.
@@ -154,7 +150,7 @@ jobs:
             | scripts/tf/plan-summary.sh --title "Terraform destroy plan (${ENV})" \
             | scripts/aws/assert-no-account-id.sh >> "$GITHUB_STEP_SUMMARY"
 
-      # The approval came before this plan existed, so a script reviews it: deletes under module.app_ecs. only, and
+      # The approval came before this plan existed, so a script reviews it: deletes under module.app_lambda. only, and
       # no action invocations. An empty stack (0 deletes) skips the apply and ends green.
       - name: Check that the plan only deletes
         id: guard
@@ -172,11 +168,6 @@ jobs:
         if: steps.guard.outputs.deletes != '0'
         run: terraform -chdir="$TF_DIR" apply -input=false -lock-timeout=5m -no-color tfplan
 
-      # Runs whether or not anything was deleted; it refuses to act while the service still exists.
-      - name: Deregister the task definition revisions
-        id: revisions
-        run: scripts/ecs/deregister-revisions.sh >> "$GITHUB_OUTPUT"
-
       # The result says what happened, not what was planned: "deleted" only when the apply step succeeded. The
       # role name comes from a helper, because configure-aws-credentials masks the whole ARN in logs.
       - name: Report the result
@@ -185,7 +176,6 @@ jobs:
           ACCOUNT: ${{ secrets.AWS_ACCOUNT_ID }}
           DELETES: ${{ steps.guard.outputs.deletes }}
           APPLY_OUTCOME: ${{ steps.destroy.outcome }}
-          DEREGISTERED: ${{ steps.revisions.outputs.DEREGISTERED }}
         run: |
           set -euo pipefail
           ROLE="$(scripts/names.sh role 2>/dev/null)" || ROLE="not assumed"

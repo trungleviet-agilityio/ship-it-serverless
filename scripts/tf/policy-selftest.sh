@@ -88,6 +88,7 @@ bad r2c 2 modules/m/sg.tf 'resource "aws_security_group" "s" {\n  dynamic "ingre
 bad r2d 2 modules/m/sg.tf 'resource "aws_security_group" "s" {\n  egress = [\n  ]\n}'
 bad r3a 3 modules/m/p.tf 'locals { p = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole" }'
 bad r3c 3 modules/m/p.tf 'locals { p = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole" }'
+bad r3d 3 modules/m/p.tf 'locals { p = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy" }'
 bad r3b 3 modules/m/p.tf 'resource "aws_iam_role_policy_attachment" "a" {}'
 bad r4 4 modules/m/role.tf 'resource "aws_iam_role" "bad" {\n  name = "y"\n}'
 
